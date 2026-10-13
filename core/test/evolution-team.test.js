@@ -2,12 +2,35 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { execFileSync, spawnSync } = require('node:child_process');
-const { test } = require('node:test');
+const { test, after } = require('node:test');
+// 隔离整个测试进程，必须先于业务模块加载；写入前核对夹具边界。
+const tempRoot = path.resolve(os.tmpdir());
+const dataPrefix = path.resolve(tempRoot, 'farm-team-data-');
+assert.ok(dataPrefix.startsWith(tempRoot + path.sep));
+const suiteDataDir = fs.mkdtempSync(dataPrefix);
+const previousDataDir = process.env.FARM_DATA_DIR;
+process.env.FARM_DATA_DIR = suiteDataDir;
+const sourceFiles = ['../src/services/evolution-team.js', './evolution-team.test.js'].map(file => path.resolve(__dirname, file));
+const sourceSnapshot = () => sourceFiles.map(file => ({
+  file, mode: fs.statSync(file).mode & 0o777,
+  digest: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'),
+}));
+const beforeSources = sourceSnapshot();
+after(() => {
+  try { assert.deepEqual(sourceSnapshot(), beforeSources, '测试成功或失败后源码内容及权限必须相同'); }
+  finally {
+    assert.ok(path.resolve(suiteDataDir).startsWith(tempRoot + path.sep));
+    fs.rmSync(suiteDataDir, { recursive: true, force: true });
+    if (previousDataDir === undefined) delete process.env.FARM_DATA_DIR;
+    else process.env.FARM_DATA_DIR = previousDataDir;
+  }
+});
 const {
   normalizeAgentSettings, validateAgentSettings, parseStageResult,
   teamJournalPath, readTeamJournal, isTeamResultApproved, runTeamWorkflow,
-  createTeamError, normalizeTeamFailure,
+  createTeamError, normalizeTeamFailure, normalizeCheckpoint,
 } = require('../src/services/evolution-team');
 const { normalizePersistedState, normalizeActiveRun } = require('../src/services/activity-evolver');
 const { requireEvolutionConfigAdmin } = require('../src/controllers/admin-activity-update-routes');
@@ -108,6 +131,337 @@ test('主 Agent 确认零改动时不启动实施、不制造提交', async () =
     ? { decision: 'no_change', summary: '当前实现已经满足要求', allowedFiles: [], acceptanceChecks: [] } : runStage(...args);
   assert.equal((await runTeamWorkflow(f.deps)).decision, 'no_change');
   assert.deepEqual(f.calls, [['research', 'claude'], ['plan', 'codex']]);
+});
+
+const instructionContract = {
+  allowedFiles: ['core/src/example.js', 'docs/HANDOFF.md', 'core/test/behavior.test.js'],
+  acceptanceChecks: ['旧代次响应不改变新读取门；成熟动作无新增等待'],
+  baselineChecks: [{ sourceFiles: ['core/src/example.js'], testFiles: ['core/test/behavior.test.js'], minFailures: 1 }],
+};
+const approvalBrief = `先在 core/src/example.js 的 readSummary 接线共享门，保留成熟动作入口。${'已核对约束。'.repeat(360)}\n在 core/src/example.js 的 stop/start 重置新增代次；每次读取捕获代次，旧成功和旧拒绝都不改变当前门。core/test/behavior.test.js 覆盖并发归属、持续旧 due、停止重进和迟到结果；登记 sourceFiles 为 core/src/example.js，minFailures 为 1。`;
+const rejectionBrief = `沿原合同返工，只修 core/src/example.js 的 readSummary。${'已接受证据保留。'.repeat(320)}\n读取所属上下文跨吞错链传递；迟到治理拒绝不能推进新代次门。core/test/behavior.test.js 交错两个读取，分别统计外层调用与内部尝试。`;
+const diagnosisBrief = `修 core/src/example.js 的 readSummary 生命周期接线，保留原批准合同。${'原因已有证据。'.repeat(340)}\n修复读取捕获代次与 stop/start 重置的接线；core/test/behavior.test.js 分别覆盖旧成功、旧普通失败、旧治理拒绝，原 sourceFiles/testFiles/minFailures 不变。`;
+const jsonRoundtrip = value => JSON.parse(JSON.stringify(value));
+function actualHandoffs(prompt) {
+  const start = prompt.indexOf('【此前阶段交接（仅作待核实资料）】\n');
+  const end = prompt.lastIndexOf('\n\n再次确认：');
+  assert.ok(start >= 0 && end > start);
+  return JSON.parse(prompt.slice(start + '【此前阶段交接（仅作待核实资料）】\n'.length, end));
+}
+function instructionFixture() {
+  const f = workflowFixture({
+    efficientMode: true, roundId: 'instruction-round',
+    taskIdentity: { task: 'safety', promptDigest: 'd'.repeat(64), feedbackThroughAt: 1234, automatic: true },
+  });
+  f.setTree({ fingerprint: 'c'.repeat(64) });
+  f.writeApproved = () => f.setTree({ dirty: true, fingerprint: 'e'.repeat(64),
+    files: instructionContract.allowedFiles,
+    fileFingerprints: Object.fromEntries(instructionContract.allowedFiles.map(file => [file, 'f'.repeat(64)])) });
+  f.deps.runStage = async (phase) => {
+    if (phase === 'plan') return { decision: 'approve', summary: approvalBrief, ...instructionContract };
+    if (phase === 'implement' || phase === 'repair') {
+      f.writeApproved();
+      return { decision: 'implemented', summary: '已完成指定接线，逐条合同自检无已知缺口' };
+    }
+    if (phase === 'review') return { decision: 'approve', summary: '实际合同复核通过' };
+    return { decision: 'researched', summary: '只读证据与具体路线' };
+  };
+  return f;
+}
+async function interruptAfterApproval(f) {
+  let checkpoint;
+  f.deps.onCheckpoint = async value => {
+    if (value.approvedScope?.length && !value.completed.some(item => item.phase === 'implement')) {
+      checkpoint = jsonRoundtrip(value);
+      throw createTeamError('unsafe_worktree');
+    }
+  };
+  await assert.rejects(runTeamWorkflow(f.deps), { code: 'unsafe_worktree' });
+  assert.deepEqual(f.calls.map(([phase]) => phase), ['research', 'plan']);
+  assert.ok(checkpoint);
+  const normalized = normalizeCheckpoint(checkpoint);
+  assert.ok(normalized, '凭据来自实际批准及协调持久化，不手造批准');
+  assert.deepEqual(normalized.approvedScope, [...instructionContract.allowedFiles].sort());
+  assert.deepEqual(normalized.acceptanceChecks, instructionContract.acceptanceChecks);
+  assert.deepEqual(normalized.baselineChecks, instructionContract.baselineChecks);
+  return normalized;
+}
+function assertResumedContract(handoffs) {
+  const approval = handoffs.find(item => item.phase === 'plan' && item.decision === 'approve');
+  assert.equal(approval.summary, approvalBrief);
+  const resumed = handoffs.find(item => item.phase === 'resume');
+  assert.deepEqual(resumed.allowedFiles, [...instructionContract.allowedFiles].sort());
+  assert.deepEqual(resumed.acceptanceChecks, instructionContract.acceptanceChecks);
+  assert.deepEqual(resumed.baselineChecks, instructionContract.baselineChecks);
+}
+
+test('真实批准中断→checkpoint roundtrip→实施及返工收到两千字后的完整接线和原合同', async () => {
+  assert.ok(approvalBrief.indexOf('stop/start') > 2000);
+  assert.ok(rejectionBrief.indexOf('读取所属上下文') > 2000);
+  const f = instructionFixture();
+  const checkpoint = await interruptAfterApproval(f);
+  assert.equal(checkpoint.completed.find(item => item.phase === 'plan').summary, approvalBrief);
+  assert.deepEqual(normalizeCheckpoint(jsonRoundtrip(checkpoint)), checkpoint);
+  const stage = f.deps.runStage;
+  const records = [];
+  let reviews = 0;
+  f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'implement' || phase === 'repair') assertResumedContract(actualHandoffs(prompt));
+    if (phase === 'repair') {
+      const handoffs = actualHandoffs(prompt);
+      assert.equal(handoffs.find(item => item.phase === 'review' && item.decision === 'reject').summary, rejectionBrief);
+      assert.equal(handoffs.findLast(item => item.phase === 'diagnose').summary, rejectionBrief);
+    }
+    if (phase === 'review' && ++reviews === 1) return { decision: 'reject', summary: rejectionBrief };
+    return stage(phase, agent, prompt);
+  };
+  f.deps.verify = async contract => assert.deepEqual(contract.baselineChecks, instructionContract.baselineChecks);
+  const result = await runTeamWorkflow({ ...f.deps, resume: jsonRoundtrip(checkpoint) });
+  assert.equal(result.decision, 'approve');
+  assert.equal(result.reviewRecoveryAttempt, 1);
+  assert.equal(result.runtimeRecoveryAttempt, 0);
+  assert.equal(result.planRevision, 0);
+  assert.equal(result.reviewFeedback, '', '真实最终验收批准取代先前拒绝意见');
+  const rejected = records.find(value => value.completed.some(item => item.phase === 'review' && item.decision === 'reject'));
+  assert.equal(normalizeCheckpoint(rejected).completed.find(item => item.phase === 'review').summary, rejectionBrief);
+  assert.equal(normalizeCheckpoint(rejected).reviewFeedback, rejectionBrief, '真实未决最终拒绝不能因 plan 已批准而清除');
+  assert.equal(records.at(-1).reviewFeedback, '');
+  assert.equal(f.calls.filter(([phase]) => phase === 'git-commit').length, 1);
+});
+
+test('真实诊断和修复中断后，续接 repair 保留详细接线、批准合同及同轮剩余预算', async () => {
+  assert.ok(diagnosisBrief.indexOf('修复读取捕获代次') > 2000);
+  const f = instructionFixture();
+  const approved = await interruptAfterApproval(f);
+  let repaired;
+  let interrupted = false;
+  const stage = f.deps.runStage;
+  f.deps.runStage = async (phase, agent, prompt) => phase === 'diagnose'
+    ? { decision: 'repair', summary: diagnosisBrief, allowedFiles: instructionContract.allowedFiles }
+    : stage(phase, agent, prompt);
+  f.deps.onCheckpoint = async value => {
+    if (!interrupted && value.completed.some(item => item.phase === 'repair')) {
+      interrupted = true;
+      repaired = jsonRoundtrip(value);
+      throw createTeamError('unsafe_worktree');
+    }
+  };
+  const initialFailure = normalizeTeamFailure(createTeamError('cli_exit'), 'implement', 'claude');
+  await assert.rejects(runTeamWorkflow({ ...f.deps, resume: approved, initialFailure }), { code: 'unsafe_worktree' });
+  const checkpoint = normalizeCheckpoint(jsonRoundtrip(repaired));
+  assert.ok(checkpoint);
+  assert.equal(checkpoint.completed.find(item => item.phase === 'diagnose').summary, diagnosisBrief);
+  assert.equal(checkpoint.counters.runtimeRecoveryAttempt, 1);
+  f.deps.onCheckpoint = async () => {};
+  let repairRan = false;
+  f.deps.runStage = async (phase, agent, prompt) => {
+    const handoffs = actualHandoffs(prompt);
+    if (phase === 'diagnose' || phase === 'repair') {
+      assertResumedContract(handoffs);
+      assert.equal(handoffs.find(item => item.phase === 'diagnose').summary, diagnosisBrief);
+    }
+    if (phase === 'diagnose') return { decision: 'repair', summary: '按已注入的详细诊断指令处理同一接线，范围不变', allowedFiles: instructionContract.allowedFiles };
+    if (phase === 'repair') repairRan = true;
+    return stage(phase, agent, prompt);
+  };
+  f.deps.verify = async contract => assert.deepEqual(contract.baselineChecks, instructionContract.baselineChecks);
+  const result = await runTeamWorkflow({ ...f.deps, resume: checkpoint, initialFailure });
+  assert.equal(result.decision, 'approve');
+  assert.equal(repairRan, true);
+  assert.equal(result.runtimeRecoveryAttempt, 2, '同轮续接继续计数，不能刷新预算');
+  assert.equal(result.reviewRecoveryAttempt, 0);
+});
+
+test('拒绝的具体路线仅进入只读 revise_plan，未经后来批准不能实施或获得文件权限', async () => {
+  for (const writesDuringRevision of [false, true]) {
+    const f = instructionFixture();
+    const records = [];
+    const stage = f.deps.runStage;
+    let plans = 0;
+    f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+    const rejectedSummary = `${rejectionBrief}\n仅作只读修订方向：core/src/unapproved.js 需进一步核对，本次不授权。`;
+    f.deps.runStage = async (phase, agent, prompt) => {
+      if (phase === 'plan' && ++plans === 1) return { decision: 'reject', summary: rejectedSummary, allowedFiles: [], acceptanceChecks: [], baselineChecks: [] };
+      if (phase === 'revise_plan') {
+        assert.equal(f.calls.some(([name]) => name === 'implement'), false);
+        assert.equal(actualHandoffs(prompt).find(item => item.phase === 'plan').summary, rejectedSummary);
+        const checkpoint = normalizeCheckpoint(records.at(-1));
+        assert.ok(checkpoint);
+        assert.equal(checkpoint.completed.find(item => item.phase === 'plan').summary, rejectedSummary);
+        assert.deepEqual(checkpoint.allowedFiles, []);
+        assert.deepEqual(checkpoint.approvedScope, []);
+        if (writesDuringRevision) f.writeApproved();
+        return { decision: 'researched', summary: '仅修订指定路线及测试登记' };
+      }
+      return stage(phase, agent, prompt);
+    };
+    if (writesDuringRevision) {
+      await assert.rejects(runTeamWorkflow(f.deps), { code: 'readonly_changed' });
+      assert.equal(f.calls.some(([name]) => name === 'implement' || name === 'git-commit'), false);
+    } else {
+      const result = await runTeamWorkflow(f.deps);
+      assert.equal(result.decision, 'approve');
+      assert.equal(result.planRevision, 1);
+      assert.deepEqual(f.calls.slice(0, 5).map(([name]) => name), ['research', 'plan', 'revise_plan', 'plan', 'implement']);
+      assert.equal(records.some(value => value.allowedFiles.includes('core/src/unapproved.js')), false);
+    }
+  }
+});
+
+test('方案拒绝→真实批准→CLI 失败不再报告旧拒绝；旧 checkpoint 续接保留授权及恢复预算', async () => {
+  const f = instructionFixture();
+  const stage = f.deps.runStage;
+  const planRefusal = '暂不批准；只读修订 core/src/example.js 的读取归属接线';
+  const records = [];
+  const progress = [];
+  const originalProgress = f.deps.onProgress;
+  let plans = 0;
+  f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+  f.deps.onProgress = async (phase, agent, details) => {
+    progress.push({ phase, ...details });
+    await originalProgress(phase, agent, details);
+  };
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'plan' && ++plans === 1) return {
+      decision: 'reject', summary: planRefusal, allowedFiles: [], acceptanceChecks: [], baselineChecks: [],
+    };
+    if (phase === 'implement' || phase === 'repair') {
+      assert.ok(actualHandoffs(prompt).some(item => item.phase === 'plan' && item.decision === 'reject'
+        && item.summary === planRefusal), '原拒绝仍是历史证据，不作为当前阻断意见');
+      throw createTeamError('cli_exit', { exitCode: 1 });
+    }
+    if (phase === 'diagnose') return { decision: 'repair', summary: diagnosisBrief, allowedFiles: instructionContract.allowedFiles };
+    return stage(phase, agent, prompt);
+  };
+  let failure;
+  await assert.rejects(runTeamWorkflow(f.deps), error => {
+    failure = error;
+    return error.code === 'recovery_exhausted' && error.failure.code === 'cli_exit';
+  });
+  assert.equal(failure.recoveryInfo.reviewFeedback, '');
+  assert.equal(failure.recoveryInfo.runtimeRecoveryAttempt, 2);
+  assert.equal(failure.recoveryInfo.reviewRecoveryAttempt, 0);
+  assert.equal(failure.recoveryInfo.planRevision, 1);
+  assert.ok(progress.filter(item => ['implement', 'diagnose', 'repair'].includes(item.phase))
+    .every(item => item.reviewFeedback === ''));
+  const checkpoint = records.at(-1);
+  assert.equal(checkpoint.reviewFeedback, '');
+  assert.equal(checkpoint.completed.find(item => item.phase === 'plan').decision, 'approve');
+  assert.deepEqual(checkpoint.approvedScope, [...instructionContract.allowedFiles].sort());
+  assert.deepEqual(checkpoint.acceptanceChecks, instructionContract.acceptanceChecks);
+  assert.deepEqual(checkpoint.baselineChecks, instructionContract.baselineChecks);
+  assert.equal(f.calls.some(([phase]) => phase === 'review' || phase === 'git-commit'), false);
+
+  // 仅模拟旧版留下的冗余意见，所有授权/身份/预算均沿用实际协调记录。
+  const legacy = { ...jsonRoundtrip(checkpoint), reviewFeedback: planRefusal };
+  const normalized = normalizeCheckpoint(legacy);
+  assert.ok(normalized);
+  assert.equal(normalized.reviewFeedback, '');
+  assert.deepEqual(normalized.counters, checkpoint.counters);
+  assert.deepEqual(normalized.approvedScope, checkpoint.approvedScope);
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'implement') assertResumedContract(actualHandoffs(prompt));
+    return stage(phase, agent, prompt);
+  };
+  f.deps.verify = async contract => assert.deepEqual(contract.baselineChecks, instructionContract.baselineChecks);
+  const resumed = await runTeamWorkflow({ ...f.deps, resume: legacy, initialReviewFeedback: planRefusal });
+  assert.equal(resumed.decision, 'approve');
+  assert.equal(resumed.reviewFeedback, '');
+  assert.equal(resumed.runtimeRecoveryAttempt, 2, '真实同轮预算不能因失效展示意见而重置');
+  assert.equal(resumed.reviewRecoveryAttempt, 0);
+  assert.equal(resumed.planRevision, 1);
+  assert.equal(records.at(-1).reviewFeedback, '');
+});
+
+test('方案拒绝后真实 no_change 清除当前拒绝意见，不增加实施或提交', async () => {
+  const f = instructionFixture();
+  const stage = f.deps.runStage;
+  const records = [];
+  let plans = 0;
+  f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'plan') return plans++ === 0
+      ? { decision: 'reject', summary: '尚缺只读行为证据', allowedFiles: [], acceptanceChecks: [], baselineChecks: [] }
+      : { decision: 'no_change', summary: '指定证据核实无需改动', allowedFiles: [], acceptanceChecks: [], baselineChecks: [] };
+    return stage(phase, agent, prompt);
+  };
+  const result = await runTeamWorkflow(f.deps);
+  assert.equal(result.decision, 'no_change');
+  assert.equal(result.reviewFeedback, '');
+  assert.equal(result.planRevision, 1);
+  assert.equal(result.runtimeRecoveryAttempt, 0);
+  assert.equal(records.at(-1).reviewFeedback, '');
+  assert.equal(normalizeCheckpoint(records.at(-1)).reviewFeedback, '');
+  assert.equal(f.calls.some(([phase]) => phase === 'implement' || phase === 'git-commit'), false);
+});
+
+test('真实 journal 读取以当前有效批准凭据清理旧方案意见，保留未决或当前外层复核拒绝', async () => {
+  const f = instructionFixture();
+  const approved = await interruptAfterApproval(f);
+  const active = normalizeActiveRun({
+    runId: 'legacy-feedback', baseCommit: approved.baselineHead,
+    agent: 'codex', subAgent: 'claude', dualAgentEnabled: true,
+  });
+  const journalDir = path.resolve(suiteDataDir, 'legacy-journal');
+  assert.ok(journalDir.startsWith(path.resolve(suiteDataDir) + path.sep));
+  const journalFile = path.resolve(teamJournalPath(journalDir, active.runId));
+  assert.ok(journalFile.startsWith(journalDir + path.sep));
+  fs.mkdirSync(journalDir, { recursive: true });
+  const oldRefusal = '暂不批准，先修订旧方案';
+  const currentRefusal = '最终验收未通过，当前读取失败分支没有行为证据';
+  const journal = {
+    runId: active.runId, baseCommit: active.baseCommit, mainAgent: 'codex', subAgent: 'claude',
+    phase: 'failed', status: 'failed', activeAgent: '', head: active.baseCommit,
+    failure: normalizeTeamFailure(createTeamError('cli_exit'), 'implement', 'claude'),
+    reviewFeedback: oldRefusal, checkpoint: { ...approved, reviewFeedback: oldRefusal },
+  };
+  const read = fields => {
+    assert.ok(path.resolve(journalFile).startsWith(journalDir + path.sep));
+    fs.writeFileSync(journalFile, JSON.stringify({ ...journal, ...fields }), { mode: 0o600 });
+    const result = readTeamJournal(journalDir, active);
+    assert.ok(result);
+    assert.equal(isTeamResultApproved(result, active.baseCommit), false, '清理展示意见不代表任务验收成功');
+    return result;
+  };
+  try {
+    const legacy = read({});
+    assert.equal(legacy.reviewFeedback, '');
+    assert.equal(legacy.checkpoint.reviewFeedback, '');
+    assert.equal(legacy.failure.code, 'cli_exit');
+    assert.deepEqual(legacy.checkpoint.approvedScope, approved.approvedScope);
+    assert.deepEqual(legacy.checkpoint.counters, approved.counters);
+    for (const checkpoint of [null, { version: 1 }, { ...approved, baselineHead: 'b'.repeat(40) }]) {
+      assert.equal(read({ checkpoint }).reviewFeedback, oldRefusal, '无效/缺失/不属于当前基线的凭据不能推定批准');
+    }
+    assert.equal(read({
+      failure: normalizeTeamFailure(createTeamError('review_rejected'), 'review', 'codex'),
+      reviewFeedback: currentRefusal,
+    }).reviewFeedback, currentRefusal, '外层真实最新复核拒绝不能被较早的批准凭据吞掉');
+
+    const stage = f.deps.runStage;
+    const records = [];
+    f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+    f.deps.runStage = async (phase, agent, prompt) => {
+      if (phase === 'review') return { decision: 'reject', summary: currentRefusal };
+      if (phase === 'repair') throw createTeamError('cli_exit');
+      if (phase === 'diagnose') return { decision: 'repair', summary: diagnosisBrief, allowedFiles: instructionContract.allowedFiles };
+      return stage(phase, agent, prompt);
+    };
+    let failure;
+    await assert.rejects(runTeamWorkflow({ ...f.deps, resume: approved }), error => {
+      failure = error;
+      return error.code === 'recovery_exhausted';
+    });
+    const rejected = read({ checkpoint: records.at(-1), failure: failure.failure, reviewFeedback: currentRefusal });
+    assert.equal(rejected.reviewFeedback, currentRefusal);
+    assert.equal(rejected.checkpoint.reviewFeedback, currentRefusal);
+    assert.equal(rejected.checkpoint.completed.find(item => item.phase === 'review').decision, 'reject');
+    assert.equal(rejected.failure.code, 'cli_exit', '后续执行失败不掩盖仍未解决的真实复核拒绝');
+  } finally {
+    assert.ok(path.resolve(journalDir).startsWith(path.resolve(suiteDataDir) + path.sep));
+    fs.rmSync(journalDir, { recursive: true, force: true });
+  }
 });
 
 for (const blockedPhase of ['research', 'plan', 'implement', 'verify', 'review']) {

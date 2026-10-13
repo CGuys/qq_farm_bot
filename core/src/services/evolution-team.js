@@ -219,6 +219,18 @@ function readTeamJournal(logDir, active) {
       || !PHASES.has(value.phase) || !['running', 'completed', 'failed'].includes(value.status)) return null;
     if (value.status === 'completed' && (value.decision === 'no_change'
       ? value.head !== active.baseCommit : value.head === active.baseCommit)) return null;
+    const normalizedCheckpoint = normalizeCheckpoint(value.checkpoint);
+    // 空 in_run 没有证明已完成阶段，不作为续接凭据；runner 的校验保持原样。
+    const checkpoint = normalizedCheckpoint?.kind === 'in_run' && !normalizedCheckpoint.completed.length
+      ? null : normalizedCheckpoint;
+    const currentCheckpoint = checkpoint && (checkpoint.kind === 'post_apply'
+      ? checkpoint.patchHead === active.baseCommit : checkpoint.baselineHead === active.baseCommit);
+    // 旧 journal 外层可能仍是早先的方案拒绝。有效当前批准凭据可清理这份失效
+    // 提示；当前真实复核拒绝（包括比 checkpoint 晚落盘的外层失败）必须保留。
+    const obsoletePlanFeedback = currentCheckpoint
+      && checkpoint.completed.some(item => item.phase === 'plan' && ['approve', 'no_change'].includes(item.decision))
+      && !hasOutstandingReviewRejection(checkpoint.completed)
+      && !(value.status === 'failed' && value.failure?.code === 'review_rejected');
     return {
       phase: value.phase,
       status: value.status,
@@ -240,21 +252,12 @@ function readTeamJournal(logDir, active) {
       runtimeRecoveryAttempt: Math.min(2, Math.max(0, Number(value.runtimeRecoveryAttempt) || 0)),
       reviewRecoveryAttempt: Math.min(2, Math.max(0, Number(value.reviewRecoveryAttempt) || 0)),
       planRevision: Math.min(MAX_PLAN_REVISIONS, Math.max(0, Number(value.planRevision) || 0)),
-      reviewFeedback: safeReviewFeedback(value.reviewFeedback),
+      reviewFeedback: obsoletePlanFeedback ? checkpoint.reviewFeedback : safeReviewFeedback(value.reviewFeedback),
       feedbackReviewed: value.feedbackReviewed === true,
       reviewedBy: value.mainAgent,
       githubResolutions: journalGithubResolutions(value),
       lessons: normalizeLessons(value.lessons),
-      checkpoint: (() => {
-        const checkpoint = normalizeCheckpoint(value.checkpoint);
-        // 2026-10-09 交替失败根因：research 未完成即失败的轮次也会落盘 in_run
-        // checkpoint（completed=[]）。它什么都没证明，runner 侧 validateResumeInput
-        // 按凭据不完整拒绝（invalid_decision），自主策略却仍把它当续接凭据逐小时
-        // 重投 → invalid_decision ↔ session_failed 无限交替。此类凭据不构成续接
-        // 身份：journal 读取侧不再作为 checkpoint 提供（走 fresh 重新诊断）；
-        // runner 的身份/完整性检查保持原样（直接传入仍被拒绝，不放宽任何校验）。
-        return checkpoint && checkpoint.kind === 'in_run' && !checkpoint.completed.length ? null : checkpoint;
-      })(),
+      checkpoint,
     };
   } catch { return null; }
 }
@@ -268,6 +271,19 @@ function isTeamResultApproved(journal, head) {
 // 合法形状。此处只做形状与合法性归一，内容真伪由 runner 以当前工作区实测校验。
 // 形状不完整（缺身份/非法条目）一律整体拒绝（null），绝不归一成空数组/默认身份
 // 后降低约束继续用。
+function completedPhaseHandoff({ phase, decision, summary }) {
+  // 主 Agent 的接线与返工指令需要随真实 checkpoint 保留；摘要本身不授予写权限。
+  const instructions = ['plan', 'diagnose'].includes(phase)
+    || (decision === 'reject' && ['review', 'repair_review', 'patch_review'].includes(phase));
+  return { phase, decision: decision || '',
+    ...(summary ? { summary: String(summary).slice(0, instructions ? 6000 : 2000) } : {}) };
+}
+
+function hasOutstandingReviewRejection(completed) {
+  return [...completed].some(item => ['review', 'repair_review', 'patch_review'].includes(item.phase)
+    && item.decision === 'reject');
+}
+
 function normalizeCheckpoint(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== 1) return null;
   const hex = (text, length) => (typeof text === 'string' && new RegExp(`^[0-9a-f]{${length}}$`).test(text) ? text : '');
@@ -317,8 +333,7 @@ function normalizeCheckpoint(value) {
     if (!item || typeof item !== 'object' || Array.isArray(item) || !PHASES.has(item.phase)
       || typeof item.decision !== 'string' || !item.decision || item.decision.length > 20
       || (item.summary !== undefined && typeof item.summary !== 'string')) return null;
-    completed.push({ phase: item.phase, decision: item.decision,
-      ...(item.summary ? { summary: item.summary.slice(0, 2000) } : {}) });
+    completed.push(completedPhaseHandoff(item));
   }
   if (value.acceptanceChecks !== undefined
     && (!Array.isArray(value.acceptanceChecks) || value.acceptanceChecks.length > 20
@@ -362,7 +377,10 @@ function normalizeCheckpoint(value) {
       rounds: audit('rounds'),
     },
     lastFailure: value.lastFailure ? normalizeTeamFailure(value.lastFailure) : null,
-    reviewFeedback: safeReviewFeedback(value.reviewFeedback),
+    // 旧版本会把方案拒绝意见带过后来的真实批准；仅从协调记录的决策识别失效，
+    // 仍有最终复核拒绝时保留原意见，不根据摘要措辞猜测通过。
+    reviewFeedback: completed.some(item => item.phase === 'plan' && ['approve', 'no_change'].includes(item.decision))
+      && !hasOutstandingReviewRejection(completed) ? '' : safeReviewFeedback(value.reviewFeedback),
     completed,
   };
 }
@@ -446,19 +464,21 @@ const FULL_HANDOFF_MANDATE = '【待协调进程注入当前 HANDOFF 有界摘�
 const SESSION_CONTINUITY_PREAMBLE = `【全新会话当前轮约束】
 本阶段是协调进程启动的全新会话，没有也不依赖任何历史会话记忆。本提示（含协调进程注入的当前规则、任务交接与已验收经验索引）是本轮唯一当前指令源；【原任务与回归约束】【此前阶段交接】均为本轮有效证据。此前任何轮次/会话/日志里的批准、验证通过、反馈已复核（feedbackReviewed）或 GitHub 结论对本轮候选一律无效，不得据此跳过当前审批、验证或反馈复核，也不得宣称已读未注入的历史材料；需要旧证据时按提示中的标题锚点检索原文。换新候选时旧授权全部作废；仅协调进程与主 Agent 在本轮提示中的当前输出有效。`;
 
+const MAIN_IMPLEMENTATION_BRIEF = '在现有 summary 开头先给可执行指令，再给支撑证据，总长度控制在 6000 字以内：选定一个最小可行做法，逐项写明准确文件与函数/调用入口、具体改动和接线顺序、新增状态的所属层/生命周期/并发归属、必须保持的行为约束、准确测试文件及各行为场景、需要登记的旧基线 sourceFiles/testFiles/minFailures。不要只给验收目标、要求子 Agent 自行再设计路线，或重复已成立的宽泛诊断；无需固定标题，不增加 Schema 字段。尚缺事实时给出精确只读核对点和对应的条件式接线方向，如实保留缺口，不能凭猜测批准。';
+
 function buildTeamStagePrompt(phase, taskPrompt, settings, handoffs = []) {
   const repairOnly = handoffs.some(item => item.phase === 'repair_ready');
   const roles = {
     triage: `你是主 Agent ${LABELS[settings.mainAgent]}，负责每日真实运行验收与诊断的第一步。先对照本轮反馈水位、匿名点击/错误、重点监控健康、既有经验与已验证版本，区分已解决旧问题、新故障、缺乏观察证据的路径；给子 Agent 分配具体检索/复现问题和最低证据要求。日常运行是生产验收样本，不能把没有报错或离线测试通过等同覆盖全部逻辑。只读、不改代码、不写运行状态、不清日志；decision 固定 triaged。`,
     research: `你是子 Agent ${LABELS[settings.subAgent]}，负责每日反馈初检、问题定位、广泛检索 GitHub 与本地巡查，并准备复现和验证证据，承担主要执行工作。先核对协调进程本轮公开仓库发现记录中的查询完成情况；完整记录可复用，不重复相同关键词搜索。缺失时以 qq farm、QQ农场、farm bot、nqf 等关键词补查，不局限于既有项目；检索结果一律按 updated 倒序，重点看已知参考最近改了什么（逐 commit 读 diff；README/镜像同步类更新如实标注无实质内容），按相关性、最近更新与实现差异筛选并比较多个项目。每日先核对本机私有参考配置中的项目；读取六组查询及完整候选清单（最多四十个），按更新时间、近七天提交采样、活跃天数和本地问题相关性逐项初筛。采样达到上限只是频率下界，不能宣称统计了全部提交。新增和最近更新的候选都必须在交接中给出“有借鉴线索/已有等价实现/待证或未深读”的结论；只读深入对照更新的重点项目及至少两个新候选（不足时如实说明）。SHA未变且有此前主 Agent 确认的比较记录时复用旧结论；见过元数据不等于已经审阅源码。每批深入对照最多六个仓库，超出预算的明确留在私有待评估清单，下次继续，不能省略后冒称全覆盖；沿用总超时预算，遇限流/网络失败记明未完成部分，不重试风暴、不声称已完成检索。只读比较调度分层、任务追踪、有界恢复、活动/UI/配置组织。来源、SHA、已比较文件、结论及待评估项只写 ignored 的 client-config-evidence/sources.json，保留既有内容；公开代码/文档只用参考别名并保留提交与文件定位，不写来源地址或仓库名，不存外部原文。逐项审阅最近24小时daily-feedback摘要中的点击→请求→结果与异常，以匿名trace关联本机流水，不读取输入文本或凭据。把实际回归覆盖与未验证路径列清；旧成功记录只证明当时已登记测试，新错误仍须复现、补行为测试。结合本地增量证据给主 Agent 提出具体方案、受影响文件、风险与验证步骤；没有可靠收益就建议零改动。decision 固定为 researched。`,
-    plan: `你是主 Agent ${LABELS[settings.mainAgent]}，负责独立巡查并确认思路。逐条审查子 Agent 的证据、GitHub 借鉴适用性、HANDOFF 不变量和修改范围。批准时给出明确文件范围、实施步骤、验收条件，将具体实现交给子 Agent。decision 为 approve（批准具体方案）、no_change（确认无需改动）或 reject（方案需重写）。approve 必须在 allowedFiles 明确列出实施文件（含 HANDOFF 和测试），并在 acceptanceChecks 逐条列出可执行的行为验收条件；需要协调器做旧代码反向对照时，必须在 baselineChecks 声明 sourceFiles/testFiles/minFailures（基线由协调器固定、只在隔离副本执行）；没有要求则为空数组。不要只在文字验收清单里要求执行器没有登记的工具动作。其他决策给空数组。拒绝后只允许子 Agent 修订方案，不得提前实施。保留用户已批准并上线的功能，不因本轮未重新找到历史材料就撤销授权或删除入口。不得仅复述子 Agent 建议。`,
-    revise_plan: `你是子 Agent ${LABELS[settings.subAgent]}，根据主 Agent 最近一次拒绝理由修订研究结论和实施建议。此阶段始终只读，不写代码、测试或文档，不重新扩展无关任务；逐条回应缺口，给出最小文件范围与真实行为测试方案，交回主 Agent 重新审批。decision 固定为 researched。`,
-    implement: `你是子 Agent ${LABELS[settings.subAgent]}，负责实施主 Agent 已批准的方案，只能修改已批准 allowedFiles，逐项满足 acceptanceChecks；这些条件是本轮验收合同。修改代码、补必要回归、更新 HANDOFF 并验证。无法按批准范围完成时停止并如实说明，不扩大范围；不得提交，由协调进程在主 Agent 复核后统一提交。decision 为 implemented 或 no_change。交接须列出实际改动、验证与未解决问题。`,
-    review: `你是主 Agent ${LABELS[settings.mainAgent]}，负责最终独立复核。读取当前完整 git diff（含新文件），对照批准方案、子 Agent 交接和协调进程测试结果，核实 HANDOFF/证据/隐私与核心收益链。以已批准的 acceptanceChecks 验收；不得在验收时新增无关需求或扩大范围，新增未决项可记录待处理。发现当前差异引入的真实回归必须指出可复现证据。拒绝时逐条说明不满足哪条合同、对应文件及所需行为测试。只能审查，不能改代码或补提提交。decision 仅可为 approve（改动满足批准方案且验证通过）或 reject（存在未解决问题）。禁止把测试通过等同业务结论正确。任务提示含 GitHub 反馈 issue 批次时，必须在 githubResolutions 中按 issue 编号逐项给出最终结论（数组不可省略，没有对应修复时输出空数组）：fixed 仅限该 issue 的问题确已在本轮改动中修复并验证，且 fingerprint 必须原样填该 issue 批次快照中的 fingerprint 字段（64 位报告版本指纹；不要预测或编造提交哈希）；每个条目都必须完整携带 issue、status、fingerprint、note 四个字段，非 fixed 结论的 fingerprint 固定填 null，note 无补充说明时填空字符串；未处理/部分处理用 in_progress，不复现/不采纳如实标注；任务提示不含 issue 批次时 githubResolutions 输出空数组；禁止为安抚报告者编造 fixed。${repairOnly ? '本次仅验收已批准的编排修复补丁，原巡检尚未完成；补丁需要应用后才能继续原任务，不得假称原任务完成。' : ''}`,
-    diagnose: `你是主 Agent ${LABELS[settings.mainAgent]}，负责本轮失败的根因诊断。先检查交接中的失败阶段、固定错误类别、退出码、已完成结论和当前工作区，再对照实际代码确认原因；不得从零重复广泛搜索。给子 Agent 制定最小修复方案、精确文件范围和验收步骤。decision 为 repair 或 stop；allowedFiles 是明确授权修改的相对文件路径数组，格式/临时执行器问题用空数组，只验证调用并准备重试。若原因已由当前版本修复，也应选 repair 并给空数组，让子 Agent 验证后继续原任务；stop 只用于仍有阻碍、无法安全自动处理的情况。鉴权、模型不可用等需要人工配置时应 stop，不读取、修改或输出任何凭据。有代码修复时必须把 docs/HANDOFF.md 和必要测试列入文件范围。只有确有编排代码缺陷时可批准下述两个输出/协作文件，并配套回归；发布器、凭据和隐私控制文件始终不能修改。`,
-    repair: `你是子 Agent ${LABELS[settings.subAgent]}，按主 Agent 最新 diagnose 中的原因、方案和 allowedFiles 执行修复。只能修改精确列出的文件；空数组表示只读排查/验证并为重试准备，不得改代码。不得通过替换结果、伪造主 Agent 的 approve、写运行状态、关闭验证、修改密钥或绕开权限来收口。decision 为 implemented 或 no_change，说明实际处理和剩余问题，交回主 Agent 验收。`,
-    repair_review: `你是主 Agent ${LABELS[settings.mainAgent]}，独立验收子 Agent 的修复。核对原失败原因、批准范围、当前差异与真实验证结果。确认修复解决原因且没有绕开检查时返回 approve，存在未解决问题返回 reject。验收通过后由协调进程重跑原失败阶段，绝不能替它伪造成功或跳过正常最终复核。`,
-    patch_review: `你是主 Agent ${LABELS[settings.mainAgent]}，负责编排修复补丁（repairOnly）的唯一最终验收。读取当前完整 git diff（含新文件），对照最近一次 diagnose 批准的文件范围与验收要求、协调进程登记的真实验证指纹与 checkpoint 记录，核实补丁确实修复了所诊断的编排缺陷，且未越出批准范围、未绕开任何检查、未夹带无关改动；隐私与提交边界由协调进程另行核对，不需要你复述。decision 仅可为 approve（补丁在批准范围内修复了诊断缺陷且验证通过）或 reject（存在未解决问题），拒绝时逐条说明不满足的合同、对应文件及所需行为测试。只能验收：不能改代码、不能补提交、不能宣布原巡检任务完成；本验收不产出 lessons/feedbackReviewed/GitHub 结论，原任务的业务反馈不得借补丁发布收口。`,
+    plan: `你是主 Agent ${LABELS[settings.mainAgent]}，负责独立巡查并裁定具体实施路线。逐条审查子 Agent 的证据、GitHub 借鉴适用性、HANDOFF 不变量和修改范围，自己决定如何接线。${MAIN_IMPLEMENTATION_BRIEF}decision 为 approve（批准具体方案）、no_change（确认无需改动）或 reject（方案需重写）。approve 必须在 allowedFiles 明确列出实施文件（含 HANDOFF 和测试），并在 acceptanceChecks 逐条列出可执行的行为验收条件；需要协调器做旧代码反向对照时，必须在 baselineChecks 声明 sourceFiles/testFiles/minFailures（基线由协调器固定、只在隔离副本执行）；没有要求则为空数组。摘要中的做法与这些登记字段必须一致，不要只在文字验收清单里要求执行器没有登记的工具动作。其他决策给空数组。reject 时为每个阻断点给出文件/入口、最小替代接线或只读核对步骤、状态边界和所需测试，让子 Agent 只修订这份具体路线；拒绝中的建议绝不授权实施，不得提前写代码。保留用户已批准并上线的功能，不因本轮未重新找到历史材料就撤销授权或删除入口。不得仅复述子 Agent 建议。`,
+    revise_plan: `你是子 Agent ${LABELS[settings.subAgent]}，按主 Agent 最近一次 reject 摘要开头的具体修订指令完善同一实施路线。此阶段始终只读，不写代码、测试或文档；拒绝中的接线建议不是实施批准。逐项落实指定文件/入口、状态归属及生命周期/并发边界、精确测试文件与场景和基线登记，集中回应全部阻断点，不重新广泛诊断或另创一套方案。只有在真实代码或证据表明指定做法不可行时，才报告具体冲突位置、原因和最小待裁定项，不笼统把设计工作交回主 Agent。交回主 Agent 重新审批，decision 固定为 researched。`,
+    implement: `你是子 Agent ${LABELS[settings.subAgent]}，负责执行主 Agent 最新真实 approve 摘要开头的具体实施指令及接线顺序，只能修改已批准 allowedFiles，逐项满足 acceptanceChecks 和登记的 baselineChecks；这些条件是本轮验收合同。批准摘要补充做法，不能凭文字扩大文件范围或跳过合同。修改代码、补必要回归、更新 HANDOFF 并验证，不重新广泛诊断或设计其他路线。交协调验证前一次检查完整差异（含新文件），按合同列出入口/状态变化、行为用例、真实结果与未解决缺口，先集中修完已知范围内问题。无法按批准做法或范围完成时停止，指出准确文件/入口及真实障碍，不扩大范围；不得提交，由协调进程在主 Agent 复核后统一提交。decision 为 implemented 或 no_change。交接须列出实际改动、验证与未解决问题。`,
+    review: `你是主 Agent ${LABELS[settings.mainAgent]}，负责最终独立复核。读取当前完整 git diff（含新文件），对照批准方案、子 Agent 交接和协调进程测试结果，核实 HANDOFF/证据/隐私与核心收益链。以已批准的 acceptanceChecks 验收；不得在验收时新增无关需求或扩大范围，新增未决项可记录待处理。发现当前差异引入的真实回归必须指出可复现证据。拒绝时先在 6000 字以内的 summary 开头集中列出各合同缺口的准确文件/入口、最小修复接线、状态/生命周期/并发边界和所需行为测试，再给证据；给子 Agent 可直接执行的范围内返工清单，不要求重新广泛诊断或改写已接受方案。返工仍受原批准文件和合同约束，摘要不新增授权。只能审查，不能改代码或补提提交。decision 仅可为 approve（改动满足批准方案且验证通过）或 reject（存在未解决问题）。禁止把测试通过等同业务结论正确。任务提示含 GitHub 反馈 issue 批次时，必须在 githubResolutions 中按 issue 编号逐项给出最终结论（数组不可省略，没有对应修复时输出空数组）：fixed 仅限该 issue 的问题确已在本轮改动中修复并验证，且 fingerprint 必须原样填该 issue 批次快照中的 fingerprint 字段（64 位报告版本指纹；不要预测或编造提交哈希）；每个条目都必须完整携带 issue、status、fingerprint、note 四个字段，非 fixed 结论的 fingerprint 固定填 null，note 无补充说明时填空字符串；未处理/部分处理用 in_progress，不复现/不采纳如实标注；任务提示不含 issue 批次时 githubResolutions 输出空数组；禁止为安抚报告者编造 fixed。${repairOnly ? '本次仅验收已批准的编排修复补丁，原巡检尚未完成；补丁需要应用后才能继续原任务，不得假称原任务完成。' : ''}`,
+    diagnose: `你是主 Agent ${LABELS[settings.mainAgent]}，负责本轮失败的根因诊断。先检查交接中的失败阶段、固定错误类别、退出码、已完成结论和当前工作区，再对照实际代码确认原因；不得从零重复广泛搜索。${MAIN_IMPLEMENTATION_BRIEF}修复原批准任务时保留有效合同与已登记基线，只调整解决当前原因必需的接线。decision 为 repair 或 stop；allowedFiles 是明确授权修改的相对文件路径数组，格式/临时执行器问题用空数组，只验证调用并准备重试。若原因已由当前版本修复，也应选 repair 并给空数组，让子 Agent 验证后继续原任务；stop 只用于仍有阻碍、无法安全自动处理的情况，摘要先给具体障碍及后续只读核对方向，不以建议授予写权限。鉴权、模型不可用等需要人工配置时应 stop，不读取、修改或输出任何凭据。有代码修复时必须把 docs/HANDOFF.md 和必要测试列入文件范围。只有确有编排代码缺陷时可批准下述两个输出/协作文件，并配套回归；发布器、凭据和隐私控制文件始终不能修改。`,
+    repair: `你是子 Agent ${LABELS[settings.subAgent]}，按主 Agent 最新真实 diagnose（含协调进程沿原授权转交的具体拒绝清单）摘要开头的指令、接线顺序和 allowedFiles 执行修复，保留原 acceptanceChecks 和有效 baselineChecks。只能修改精确列出的文件；空数组表示只读排查/验证并为重试准备，不得改代码。集中完成所有已知范围内阻断项，交协调验证前核对完整差异与逐条合同证据；只报告指定做法遇到的准确入口、冲突原因和最小待裁定项，不重开广泛诊断或另设计路线。不得通过替换结果、伪造主 Agent 的 approve、写运行状态、关闭验证、修改密钥或绕开权限来收口。decision 为 implemented 或 no_change，说明实际处理和剩余问题，交回主 Agent 验收。`,
+    repair_review: `你是主 Agent ${LABELS[settings.mainAgent]}，独立验收子 Agent 的修复。核对原失败原因、批准范围、当前差异与真实验证结果。确认修复解决原因且没有绕开检查时返回 approve，存在未解决问题返回 reject；拒绝的 summary 在 6000 字以内，开头先给每个阻断项对应文件/入口、原批准范围内的最小修复接线和行为测试，再列依据，不扩大授权或重开广泛诊断。验收通过后由协调进程重跑原失败阶段，绝不能替它伪造成功或跳过正常最终复核。`,
+    patch_review: `你是主 Agent ${LABELS[settings.mainAgent]}，负责编排修复补丁（repairOnly）的唯一最终验收。读取当前完整 git diff（含新文件），对照最近一次 diagnose 批准的文件范围与验收要求、协调进程登记的真实验证指纹与 checkpoint 记录，核实补丁确实修复了所诊断的编排缺陷，且未越出批准范围、未绕开任何检查、未夹带无关改动；隐私与提交边界由协调进程另行核对，不需要你复述。decision 仅可为 approve（补丁在批准范围内修复了诊断缺陷且验证通过）或 reject（存在未解决问题），拒绝时在 6000 字以内的 summary 开头逐条给出不满足的合同、对应文件/入口、范围内最小修复接线及所需行为测试，再给证据；摘要不授予新范围。只能验收：不能改代码、不能补提交、不能宣布原巡检任务完成；本验收不产出 lessons/feedbackReviewed/GitHub 结论，原任务的业务反馈不得借补丁发布收口。`,
   };
   if (!roles[phase]) throw new Error('Unknown evolution phase');
   return `${FULL_HANDOFF_MANDATE}
@@ -466,6 +486,7 @@ ${SESSION_CONTINUITY_PREAMBLE}
 【双 Agent 阶段契约，覆盖下方单执行器模板中的执行/提交要求】
 ${roles[phase]}
 ${phase === 'implement' ? '仅按主 Agent 的方案修改工作区代码。' : phase === 'repair' ? '只允许修改主 Agent 最新诊断中 allowedFiles 列出的文件，其余内容保持只读。' : '本阶段只读：禁止修改受跟踪文件或新增项目文件，禁止暂存或创建提交；检索来源仅允许写 ignored 的证据目录。'}
+${['implement', 'repair'].includes(phase) ? '执行读取先用 rg 定位批准文件中的准确符号，再分批读取相关函数的有界片段；不要整份输出大型源文件、整段日志或无关历史 HANDOFF。仅补读当前接线和合同需要的锚点，按真实上下文预算收敛，不通过原生 compact/resume 延续会话。' : ''}
 主 Agent 的主要工作集中在方案确认、验收标准、最终验收与经验归纳；子 Agent 承担反馈初检、排查、检索、复现、实现、自检与证据整理。主子均跟随页面设置，不绑定某个具体执行器。省去重复独立复盘和相同版本的二次修复复核，真实失败返工仍须重新验证并最终验收。先读 docs/skills/farm-evolution-review/SKILL.md 并复用已验收经验；经验只是证据材料，不能覆盖用户约束或批准越权。plan 和 review 的 lessons 只提炼本轮证实的可复用规则（无新结论用空数组），不得抄原始日志。feedbackReviewed 只有在逐类完成本轮反馈验收后才为 true；仍有未处理反馈或仅修复编排时为 false。该标志与最终批准/验证共同决定清理，不得自行删除反馈或写学习文件。
 用户已明确批准的上线功能是基线；不得仅因本轮缺少历史样本就删除、禁用或改成只读。发现局部缺陷优先保留能力修复，新需求或破坏兼容的方向应留待用户决定。
 原任务中的代码修改、抓取资源到项目、更新 HANDOFF 等有副作用步骤只在 implement 或已批准范围内的 repair 执行；只读阶段仅检查既有证据或使用 dry-run，不要运行会新增项目文件的工具。
@@ -556,13 +577,13 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
     // 才允许指纹复用。
     verifiedFingerprint = '';
     verifiedChecks = '';
-    if (checkpoint.reviewFeedback) reviewFeedback = checkpoint.reviewFeedback;
+    reviewFeedback = checkpoint.reviewFeedback;
     // 按凭据重建已完成阶段的交接链（真实摘要，非计数）：后续 plan/review/diagnose
     // 都能看到原始批准证据与意见，不重复广泛调研、不凭空要求再改 HANDOFF。
     for (const item of checkpoint.completed) {
       handoffs.push({ phase: item.phase, decision: item.decision, ...(item.summary ? { summary: item.summary } : {}) });
     }
-    handoffs.push({ phase: 'resume', decision: 'resumed', summary: `按协调进程 checkpoint 续接原任务（基线 ${checkpoint.baselineHead.slice(0, 8)}）：已完成阶段 ${checkpoint.completed.map(item => item.phase).join('、') || '无'}；授权文件 ${checkpoint.allowedFiles.length} 个按记录恢复。${checkpoint.acceptanceChecks.length ? `原验收合同：${checkpoint.acceptanceChecks.join('；')}。` : ''}验证门重新实测，不以旧指纹伪造通过。` });
+    handoffs.push({ phase: 'resume', decision: 'resumed', allowedFiles: approvedScope || [], acceptanceChecks: checkpoint.acceptanceChecks, baselineChecks: approvedBaselineChecks, summary: `按协调进程 checkpoint 续接原任务（基线 ${checkpoint.baselineHead.slice(0, 8)}）：已完成阶段 ${checkpoint.completed.map(item => item.phase).join('、') || '无'}；授权文件 ${checkpoint.allowedFiles.length} 个按记录恢复。${checkpoint.acceptanceChecks.length ? `原验收合同：${checkpoint.acceptanceChecks.join('；')}。` : ''}验证门重新实测，不以旧指纹伪造通过。` });
   }
   await persistCheckpoint({
     version: 1, kind: 'in_run', baselineHead: baseline.head,
@@ -576,8 +597,7 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
     counters: { runtimeRecoveryAttempt, reviewRecoveryAttempt, planRevision },
     auditCounters,
     approvedScope: approvedScope ? [...approvedScope].sort() : [],
-    completed: [...completedPhases.values()].map(({ phase, decision, summary }) =>
-      ({ phase, decision: decision || '', ...(summary ? { summary: String(summary).slice(0, 2000) } : {}) })),
+    completed: [...completedPhases.values()].map(completedPhaseHandoff),
   });
   const details = () => ({
     recoveryAttempt: recoveryKind === 'review' ? reviewRecoveryAttempt : runtimeRecoveryAttempt,
@@ -633,6 +653,10 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
     }
     handoffs.push({ phase: name, ...result });
     completedPhases.set(name, { ...result, phase: name });
+    if (result.decision === 'approve' && (name === 'review'
+      || (['repair_review', 'patch_review'].includes(name) && !hasOutstandingReviewRejection(completedPhases.values())))) {
+      reviewFeedback = '';
+    }
     // 授权文件必须记 UNION（plan 范围 + 历次 diagnose 范围），不能只留最后一次诊断：
     // 补丁轮叠加业务改动时，续接校验要能同时证明两批授权都还在。
     await persistCheckpoint({
@@ -641,8 +665,7 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
       ...(requiresApply ? { requiresApply: true } : {}),
       counters: { runtimeRecoveryAttempt, reviewRecoveryAttempt, planRevision },
       auditCounters,
-      completed: [...completedPhases.values()].map(({ phase, decision, summary }) =>
-        ({ phase, decision: decision || '', ...(summary ? { summary: String(summary).slice(0, 2000) } : {}) })),
+      completed: [...completedPhases.values()].map(completedPhaseHandoff),
       reviewFeedback,
     });
     return result;
@@ -849,6 +872,10 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
       await retry(() => phase('revise_plan', settings.subAgent));
     }
     plan = normalizePlanApproval(plan);
+    if (['approve', 'no_change'].includes(plan.decision) && !hasOutstandingReviewRejection(completedPhases.values())) {
+      reviewFeedback = '';
+      await persistCheckpoint({ reviewFeedback });
+    }
     if (plan.decision === 'no_change' && !(await inspect()).dirty) {
       acceptedReport = { lessons: normalizeLessons(plan.lessons), feedbackReviewed: plan.feedbackReviewed === true,
         githubResolutions: [] };
@@ -859,7 +886,7 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
       approvedBaselineChecks = plan.baselineChecks;
       for (const file of plan.allowedFiles) authorizedFiles.add(file);
       await persistCheckpoint({ acceptanceChecks: plan.acceptanceChecks, baselineChecks: plan.baselineChecks,
-        allowedFiles: [...authorizedFiles].sort() });
+        allowedFiles: [...authorizedFiles].sort(), approvedScope: [...approvedScope].sort() });
       await runImplement();
     }
     } else if (completedPhases.get('implement')?.decision !== 'implemented' && !requiresApply) {
