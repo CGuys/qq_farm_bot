@@ -236,21 +236,25 @@ test('dirty no_change and incomplete coordinator evidence never create a seal', 
     }
 });
 
-test('same-round checkpoint keeps the bounded worker invocation limit without blocking Main repair', async () => {
+test('the first worker call remains consumed across rounds; all later repairs belong to Main', async () => {
     const f = fixture();
     f.options.runMain = async () => {
         await f.call('approve_plan', f.plan);
-        for (let i = 0; i < 12; i += 1) assert.equal((await f.call('delegate_worker', { instruction: 'Read one caller', readOnly: true })).isError, false);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Implement the first draft' })).isError, false);
+        assert.equal(JSON.parse((await f.call('delegate_worker', { instruction: 'Cannot delegate a second task' })).content[0].text).code,
+            'main_repair_required');
         throw createTeamError('cli_exit');
     };
     await assert.rejects(runMainOwnedWorkflow(f.options), { code: 'cli_exit' });
     const checkpoint = f.checkpoints.at(-1);
     const { normalizeCheckpoint } = require('../src/services/evolution-team');
-    assert.equal(normalizeCheckpoint(checkpoint).mainWorkflow.workerInvocations, 12);
+    assert.equal(normalizeCheckpoint(checkpoint).mainWorkflow.workerInvocations, 1);
     f.options.resume = checkpoint;
+    f.options.roundId = 'next-round';
+    f.options.runId = 'next-session';
     f.options.runMain = async () => {
-        const refused = await f.call('delegate_worker', { instruction: 'Cannot refresh the same-round limit' });
-        assert.equal(JSON.parse(refused.content[0].text).code, 'recovery_exhausted');
+        const refused = await f.call('delegate_worker', { instruction: 'Cannot delegate repairs after a round change' });
+        assert.equal(JSON.parse(refused.content[0].text).code, 'main_repair_required');
         f.edit(FILE, 'Main still owns its small authorized repair');
         return accept(f);
     };
@@ -273,4 +277,109 @@ test('unproven child cleanup blocks the whole Main and remains blocked after nor
     f.options.runMain = async () => { assert.fail('an unproven writer cannot be bypassed by a fresh Main'); };
     await assert.rejects(runMainOwnedWorkflow(f.options), { code: 'unsafe_worktree' });
     assert.equal(f.commits, 0);
+});
+
+test('one Main repairs four distinct verification failures and passes without a two-attempt ceiling', async () => {
+    const f = fixture();
+    let workers = 0;
+    let mains = 0;
+    let checks = 0;
+    const passed = f.options.verify;
+    f.options.runWorker = async () => { workers += 1; f.edit(FILE, 'first worker draft');
+        return { decision: 'implemented', summary: 'First implementation handed to Main' }; };
+    f.options.verify = async () => {
+        checks += 1;
+        if (checks <= 4) throw Object.assign(createTeamError('verification_failed'), {
+            failureSummary: `specific failing behavior ${checks}`, logFile: `check-${checks}.log` });
+        return passed();
+    };
+    f.options.runMain = async () => {
+        mains += 1;
+        await f.call('approve_plan', f.plan);
+        await f.call('delegate_worker', { instruction: 'Produce the initial implementation' });
+        for (let i = 1; i <= 4; i += 1) {
+            const failure = await f.call('verify_candidate');
+            assert.equal(failure.isError, true);
+            const details = JSON.parse(failure.content[0].text);
+            assert.equal(details.code, 'verification_failed');
+            assert.match(details.summary, new RegExp(`specific failing behavior ${i}`));
+            const unchanged = await f.call('verify_candidate');
+            assert.equal(JSON.parse(unchanged.content[0].text).code, 'repair_required');
+            assert.equal(checks, i, 'identical failed candidates do not rerun the suite without a repair reason');
+            f.edit(FILE, `Main correction ${i}`);
+            assert.equal((await f.call('record_iteration', { cause: `behavior ${i} was wrong`,
+                changes: [`correct caller ${i}`], remainingIssues: i < 4 ? ['next behavior remains'] : [],
+                nextStep: 'Verify the corrected candidate' })).isError, false);
+            assert.equal((await f.call('delegate_worker', { instruction: 'Try delegating repair again' })).isError, true);
+        }
+        return accept(f);
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'approve');
+    assert.equal(mains, 1); assert.equal(workers, 1); assert.equal(checks, 5); assert.equal(f.commits, 1);
+    assert.equal(f.checkpoints.at(-1).mainWorkflow.repairIterations, 4);
+    assert.equal(f.checkpoints.at(-1).mainWorkflow.verificationAttempts, 5);
+});
+
+test('a new native session reads prior failure and Main repair notes across a round change', async () => {
+    const f = fixture();
+    const good = f.options.verify;
+    let failCheck = true;
+    f.options.verify = async () => {
+        if (failCheck) throw Object.assign(createTeamError('verification_failed'),
+            { failureSummary: 'returned ordinary failure loses deadline evidence', logFile: 'actual-failed-check.log' });
+        return good();
+    };
+    f.options.runMain = async () => {
+        await f.call('approve_plan', f.plan);
+        await f.call('delegate_worker', { instruction: 'Implement once' });
+        f.edit(FILE, 'real retained draft');
+        assert.equal((await f.call('verify_candidate')).isError, true);
+        failCheck = false;
+        assert.equal((await f.call('record_iteration', { cause: 'ordinary error clears proven deadline',
+            changes: ['preserved cutoff evidence'], remainingIssues: ['add rejected-read case'],
+            nextStep: 'Add the rejected-read behavior then verify' })).isError, false);
+        throw createTeamError('cli_exit');
+    };
+    const failure = await runMainOwnedWorkflow(f.options).catch(error => error);
+    assert.ok(failure.failure, 'the unresolved verification cause must survive a later Main interruption');
+    assert.equal(failure.failure.code, 'verification_failed', 'writing repair memory does not erase the unresolved cause');
+    const { normalizeCheckpoint } = require('../src/services/evolution-team');
+    const checkpoint = normalizeCheckpoint(f.checkpoints.at(-1));
+    assert.ok(checkpoint?.mainWorkflow?.memory, 'memory is retained by the production checkpoint normalizer');
+    f.options.resume = checkpoint;
+    f.options.roundId = 'new-round'; f.options.runId = 'second-native-session';
+    f.options.runWorker = async () => { assert.fail('a session restart must not call Claude again'); };
+    f.options.runMain = async ({ prompt }) => {
+        assert.match(prompt, /必须先读的逐轮修复记忆/);
+        assert.match(prompt, /ordinary error clears proven deadline/);
+        const reply = JSON.parse((await f.call('status')).content[0].text);
+        assert.ok(reply.repairMemory, 'Main receives the stable memory location');
+        const index = JSON.parse(fs.readFileSync(reply.repairMemory.indexFile));
+        assert.equal(index.latestFailure.summary, 'returned ordinary failure loses deadline evidence');
+        const notes = index.recent.map(entry => JSON.parse(fs.readFileSync(entry.file)));
+        const repair = notes.find(entry => entry.kind === 'main_repair');
+        assert.ok(repair, 'the full earlier repair event remains readable');
+        assert.deepEqual(repair.remainingIssues, ['add rejected-read case']);
+        f.edit(FILE, 'deadline and rejected-read behavior repaired');
+        return accept(f);
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'approve');
+    assert.equal(f.checkpoints.at(-1).mainWorkflow.workerInvocations, 1);
+});
+
+test('an unchanged environmental retry requires and retains an explicit Main explanation', async () => {
+    const f = fixture(); let checks = 0;
+    const passed = f.options.verify;
+    f.options.verify = async () => { checks += 1; if (checks === 1) throw createTeamError('verification_failed'); return passed(); };
+    f.options.runMain = async () => {
+        assert.equal((await f.call('verify_candidate')).isError, true);
+        assert.equal((await f.call('verify_candidate')).isError, true);
+        assert.equal(checks, 1);
+        assert.equal((await f.call('record_iteration', { cause: 'fixture child readiness was not reached', changes: [],
+            remainingIssues: ['confirm actual child ready record'], nextStep: 'Retry after the ready record exists',
+            retryUnchanged: true })).isError, false);
+        return accept(f, 'no_change');
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'no_change');
+    assert.equal(checks, 2);
 });

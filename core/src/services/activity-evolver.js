@@ -599,11 +599,25 @@ function stopEvolutionProcessGroup(pid) {
 }
 
 function evolutionWatchDecision({ now = Date.now(), launchedAt = 0, headChanged = false,
-  worktreeDirty = false, logMtimeMs = 0 } = {}) {
-  if (now - Number(launchedAt || 0) >= STALE_RUN_MS) return 'hard_timeout';
+  worktreeDirty = false, logMtimeMs = 0, mainOwned = false } = {}) {
+  const progressAt = mainOwned ? Math.max(Number(launchedAt) || 0, Math.min(now, Number(logMtimeMs) || 0))
+    : Number(launchedAt) || 0;
+  if (now - progressAt >= STALE_RUN_MS) return 'hard_timeout';
   if (headChanged && !worktreeDirty && logMtimeMs > 0
       && now - logMtimeMs >= EVOLUTION_COMMIT_IDLE_MS) return 'committed_idle';
   return '';
+}
+
+function evolutionWatchEvidence(active, logFile) {
+  let logMtimeMs = 0;
+  try { logMtimeMs = fs.statSync(logFile).mtimeMs; } catch {}
+  const journal = active?.dualAgentEnabled ? readTeamJournal(EVOLVE_LOG_DIR, active) : null;
+  const mainOwned = journal?.orchestration === 'main-owned';
+  if (mainOwned) {
+    try { logMtimeMs = Math.max(logMtimeMs, fs.statSync(path.join(EVOLVE_LOG_DIR,
+      `evolve-team-${active.runId}-main-events.log`)).mtimeMs); } catch {}
+  }
+  return { logMtimeMs, mainOwned };
 }
 
 function formatEvolutionChangeSummary(subject, numstat, commit = '') {
@@ -923,6 +937,10 @@ function describeTeamFailure(collaboration) {
   const failure = collaboration?.failure ? normalizeTeamFailure(collaboration.failure) : null;
   const phase = failure ? names[failure.phase] || '协作' : '协作';
   const attempts = Math.max(0, Number(collaboration?.recoveryAttempt) || 0);
+  if (collaboration?.checkpoint?.mainWorkflow?.version === 2) {
+    const workflow = collaboration.checkpoint.mainWorkflow;
+    return `${failure?.agent ? `${AGENT_LABELS[failure.agent]} ` : ''}${phase}阶段：${failure?.label || '任务尚未完成'}；主 Agent 已记录 ${workflow.repairIterations || 0} 轮修复、${workflow.verificationAttempts || 0} 次验证，保留逐轮记忆继续处理`;
+  }
   const budget = collaboration?.recoveryKind || collaboration?.planRevision
     ? `执行恢复 ${collaboration.runtimeRecoveryAttempt || 0}/2，验收返工 ${collaboration.reviewRecoveryAttempt || 0}/2，方案修订 ${collaboration.planRevision || 0}/2`
     : `诊断修复 ${attempts}/2 次`;
@@ -2068,18 +2086,17 @@ function launchEvolution(task, payload = {}) {
   };
   const watchAgent = () => {
     if (finalized) return;
-    let logMtimeMs = 0;
-    try { logMtimeMs = fs.statSync(logFile).mtimeMs; } catch {}
+    const evidence = evolutionWatchEvidence(activeRun, logFile);
     const decision = evolutionWatchDecision({
       launchedAt: activeRun?.launchedAt,
       headChanged: gitHead(runRoot) !== headBefore,
       worktreeDirty: !!worktreeChanges(runRoot),
-      logMtimeMs,
+      ...evidence,
     });
     if (decision) {
       logger.warn(decision === 'committed_idle'
         ? '进化 Agent 已提交且无新输出，正在结束残留进程以继续隐私扫描'
-        : '进化 Agent 超过最长运行时间，正在中止并收口');
+        : evidence.mainOwned ? '进化主 Agent 长时间没有输出，保留修复记忆后恢复' : '进化 Agent 超过最长运行时间，正在中止并收口');
       stopEvolutionProcessGroup(activeRun?.pid);
     }
     scheduler.setTimeoutTask('evolution_agent_watch', EVOLUTION_WATCH_POLL_MS, watchAgent);
@@ -3216,13 +3233,12 @@ function watchRecoveredEvolution(activeRun) {
       void finalizeRecoveredEvolution(active);
       return;
     }
-    let logMtimeMs = 0;
-    try { logMtimeMs = fs.statSync(active.logFile).mtimeMs; } catch {}
+    const evidence = evolutionWatchEvidence(active, active.logFile);
     const decision = evolutionWatchDecision({
       launchedAt: active.launchedAt,
       headChanged: gitHead(active.taskRoot || REPO_ROOT) !== active.baseCommit,
       worktreeDirty: !!worktreeChanges(active.taskRoot || REPO_ROOT),
-      logMtimeMs,
+      ...evidence,
     });
     if (decision) stopEvolutionProcessGroup(active.pid);
     scheduler.setTimeoutTask('evolution_recovery_watch', EVOLUTION_WATCH_POLL_MS, poll);

@@ -291,12 +291,33 @@ function hasOutstandingReviewRejection(completed) {
     && item.decision === 'reject');
 }
 
+function normalizeRepairMemory(value) {
+  if (!value || !/^[a-f0-9]{64}$/.test(value.identityDigest || '')
+    || !Number.isSafeInteger(value.sequence) || value.sequence < 0
+    || !Array.isArray(value.recent) || value.recent.length > 8) return null;
+  const text = (v, max) => typeof v === 'string' && v.length <= max;
+  if (value.recent.some(item => !item || !Number.isSafeInteger(item.sequence) || item.sequence < 1
+    || !text(item.kind, 40) || !text(item.summary, 900) || !text(item.file, 2048))) return null;
+  const failure = value.latestFailure;
+  if (failure && (!/^[a-f0-9]{64}$/.test(failure.fingerprint || '') || !text(failure.summary, 2500)
+    || !text(failure.logFile, 2500) || !text(failure.reportFile, 2500)
+    || !Number.isSafeInteger(failure.sequence) || failure.sequence < 1)) return null;
+  return { identityDigest: value.identityDigest, sequence: value.sequence,
+    recent: value.recent.map(({ sequence, kind, summary, file }) => ({ sequence, kind, summary, file })),
+    latestFailure: failure ? { fingerprint: failure.fingerprint, summary: failure.summary,
+      logFile: failure.logFile, reportFile: failure.reportFile, sequence: failure.sequence } : null };
+}
+
 function normalizeCheckpoint(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.version !== 1) return null;
   const hex = (text, length) => (typeof text === 'string' && new RegExp(`^[0-9a-f]{${length}}$`).test(text) ? text : '');
   const baselineHead = hex(value.baselineHead, 40);
   if (!baselineHead) return null;
   if (!['in_run', 'post_apply'].includes(value.kind)) return null;
+  const mainVersion = value.mainWorkflow?.version;
+  const memory = mainVersion === 2 && value.mainWorkflow.memory !== undefined
+    ? normalizeRepairMemory(value.mainWorkflow.memory) : null;
+  if (mainVersion === 2 && value.mainWorkflow.memory !== undefined && !memory) return null;
   let allowedFiles;
   let approvedScope;
   try {
@@ -389,8 +410,14 @@ function normalizeCheckpoint(value) {
     reviewFeedback: completed.some(item => item.phase === 'plan' && ['approve', 'no_change'].includes(item.decision))
       && !hasOutstandingReviewRejection(completed) ? '' : safeReviewFeedback(value.reviewFeedback),
     completed,
-    ...(value.mainWorkflow?.version === 1 ? { mainWorkflow: { version: 1,
+    ...([1, 2].includes(mainVersion) ? { mainWorkflow: { version: mainVersion,
       workerInvocations: Math.min(12, Math.max(0, Math.floor(Number(value.mainWorkflow.workerInvocations) || 0))),
+      ...(mainVersion === 2 ? {
+        initialWorkerInvoked: value.mainWorkflow.initialWorkerInvoked === true || Number(value.mainWorkflow.workerInvocations) > 0,
+        verificationAttempts: Math.min(1000000, Math.max(0, Math.floor(Number(value.mainWorkflow.verificationAttempts) || 0))),
+        repairIterations: Math.min(1000000, Math.max(0, Math.floor(Number(value.mainWorkflow.repairIterations) || 0))),
+        ...(memory ? { memory } : {}),
+      } : {}),
       ...(value.mainWorkflow.blocked === 'unsafe_worktree' ? { blocked: 'unsafe_worktree' } : {}),
     } } : {}),
   };

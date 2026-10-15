@@ -739,7 +739,7 @@ onUnmounted(() => evolutionStore.stopPolling())
             自动进化（活动 + 防封安全巡检）
           </h4>
           <p class="mt-1 text-xs text-purple-700/90 dark:text-purple-300/90">
-            每天北京时间 00:00-01:00 合并巡检一次；自主开启后，新活动空闲时立即进化。主 Agent 持续统筹，按需调用子 Agent、检查并修正结果，统一验证验收；中间问题保留在面板，验收通过后通知。{{ evolve?.autonomousEvolutionEnabled === true ? '完成的改动会自动应用，就绪后通知。' : '验收通过后由你点「应用进化」生效。' }}
+            每天北京时间 00:00-01:00 合并巡检一次；自主开启后，新活动空闲时立即进化。主 Agent 持续统筹，子 Agent 首次实施后，由主 Agent 自行修正并反复验证，每轮保存失败原因、改动与剩余问题；验收通过后通知。{{ evolve?.autonomousEvolutionEnabled === true ? '完成的改动会自动应用，就绪后通知。' : '验收通过后由你点「应用进化」生效。' }}
           </p>
         </div>
         <button

@@ -201,6 +201,11 @@ if (require.main === module) {
         assert.equal(reply.isError, true); assert.ok(reply.content[0].text.length <= 6000);
         const details = JSON.parse(reply.content[0].text);
         assert.ok(details.summary.includes('backend'));
+        assert.match(details.summary, /fails current candidate/);
+        assert.ok(fs.existsSync(details.reportFile));
+        const report = JSON.parse(fs.readFileSync(details.reportFile));
+        assert.equal(report.counts.fail, 1);
+        assert.deepEqual(report.failedTests, ['fails current candidate']);
         assert.ok(fs.existsSync(details.logFile));
         assert.ok(fs.readFileSync(details.logFile, 'utf8').includes('not ok'));
         const journal = JSON.parse(fs.readFileSync(f.target('core/data/logs/evolve-team-main-run.json')));

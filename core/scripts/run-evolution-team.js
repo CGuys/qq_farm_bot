@@ -218,8 +218,9 @@ function executeStreaming(bin, args, options = {}) {
     let rejected = false;
     let stdout = '';
     let timeout = null;
+    let idleTimeout = null;
     const onAbort = () => failLine(createTeamError('cli_exit', { signal: 'SIGTERM' }));
-    const cleanup = () => { clearTimeout(timeout); owned.stop(); options.signal?.removeEventListener('abort', onAbort); };
+    const cleanup = () => { clearTimeout(timeout); clearTimeout(idleTimeout); owned.stop(); options.signal?.removeEventListener('abort', onAbort); };
     const closeLog = () => { if (logFd != null) { try { fs.closeSync(logFd); } catch {} logFd = null; } };
     const failLine = (error) => {
       if (rejected) return;
@@ -239,17 +240,25 @@ function executeStreaming(bin, args, options = {}) {
     };
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (options.timeoutMs > 0) timeout = setTimeout(() => failLine(createTeamError('cli_exit')), options.timeoutMs);
+    const activity = () => {
+      clearTimeout(idleTimeout);
+      if (options.idleTimeoutMs > 0) idleTimeout = setTimeout(() => failLine(Object.assign(createTeamError('cli_exit'),
+        { failureSummary: 'Main produced no output within the idle deadline; repair memory and drafts retained.' })), options.idleTimeoutMs);
+    };
+    activity();
     if (options.signal?.aborted) onAbort();
     child.stdout.setEncoding('utf8');
     if (options.logStderr && child.stderr) {
       child.stderr.setEncoding('utf8');
       child.stderr.on('data', chunk => {
+        activity();
         owned.capture();
         if (logFd != null) { try { fs.writeSync(logFd, chunk); } catch {} }
         process.stderr.write(chunk);
       });
     }
     child.stdout.on('data', (chunk) => {
+      activity();
       owned.capture();
       if (options.echo) process.stdout.write(chunk);
       if (options.capture) {
@@ -303,6 +312,36 @@ function executeStreaming(bin, args, options = {}) {
       } else { cleanup(); closeLog(); resolve(options.capture ? stdout : undefined); }
     });
   });
+}
+
+function readVerificationFailureDetails(file) {
+  const decoder = new (require("node:string_decoder").StringDecoder)("utf8");
+  const failedTests = [];
+  const errors = [];
+  const counts = {};
+  let failedCount = 0;
+  let pending = '';
+  const line = text => {
+    const failed = text.match(/^\s*not ok \d+ - (.+)/);
+    if (failed) { failedCount += 1; if (failedTests.length < 24) failedTests.push(failed[1].slice(0, 400)); }
+    if (/error TS\d+|^\s*(?:error:|Error:|code: 'ERR_)/.test(text) && errors.length < 8) errors.push(text.trim().slice(0, 400));
+    const count = text.match(/^# (tests|pass|fail|skipped) (\d+)$/);
+    if (count) counts[count[1]] = Number(count[2]);
+  };
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buffer = Buffer.alloc(64 * 1024);
+    for (;;) {
+      const size = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (!size) break;
+      const lines = (pending + decoder.write(buffer.subarray(0, size))).split('\n');
+      pending = lines.pop().slice(-8192);
+      for (const text of lines) line(text);
+    }
+    pending += decoder.end();
+    if (pending) line(pending);
+  } finally { fs.closeSync(fd); }
+  return { counts, failedCount, failedTests, errors };
 }
 
 // Claude 外层 envelope 成功时优先 structured_output；result 必须是可严格解析的 JSON 文本。
@@ -433,6 +472,9 @@ async function main(input) {
       fields.reviewFeedback = safeReviewFeedback(details.reviewFeedback, runtimeTerms);
       if (details.lastFailure && typeof details.lastFailure === 'object') fields.lastFailure = details.lastFailure;
       if (details.orchestrationMode === 'main_owned') fields.orchestrationMode = 'main_owned';
+      for (const key of ['verificationAttempts', 'repairIterations']) {
+        if (Number.isSafeInteger(details[key])) fields[key] = details[key];
+      }
       fields.delegatedAgent = ['codex', 'claude'].includes(details.delegatedAgent) ? details.delegatedAgent : '';
     }
     persist(fields);
@@ -471,7 +513,10 @@ async function main(input) {
       const schemaText = JSON.stringify(schema);
       const eventLog = path.join(logDir, `evolve-team-${runId}-${invocationId}-events.log`);
       const options = { env: agentEnv, stdin: command.stdin, signal,
-        timeoutMs: mcp ? 60 * 60 * 1000 : 30 * 60 * 1000, eventLog, logStderr: true };
+        // Main keeps working while it makes progress; only a silent executor is
+        // interrupted. Worker tools retain their bounded individual deadline.
+        timeoutMs: mcp ? 0 : 30 * 60 * 1000,
+        idleTimeoutMs: mcp ? 2 * 60 * 60 * 1000 : 0, eventLog, logStderr: true };
       let response;
       if (agent === 'codex') {
         const config = mcp
@@ -552,20 +597,16 @@ async function main(input) {
         } catch (error) {
           // 真实测试/构建失败归为验证未通过并保留退出码；执行器无法启动等问题保留原类别。
           if (error?.code === 'cli_exit' || /^EVOLUTION_(?:VALIDATION|COUNTERCHECK)_/.test(String(error?.code || ''))) {
-            let excerpt = '';
+            let details = { counts: {}, failedCount: 0, failedTests: [], errors: [] };
+            let reportFile = '';
             try {
-              const fd = fs.openSync(logFile, 'r');
-              try {
-                const size = fs.fstatSync(fd).size;
-                const buffer = Buffer.alloc(Math.min(size, 32 * 1024));
-                fs.readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length));
-                excerpt = safeReviewFeedback(buffer.toString('utf8').split('\n')
-                  .filter(line => /not ok |error TS|Error:|ERR_/.test(line)).slice(-3)
-                  .map(line => line.slice(0, 300)).join('; '), runtimeTerms);
-              } finally { fs.closeSync(fd); }
-            } catch { /* The fixed failure class remains truthful without a readable log. */ }
+              details = readVerificationFailureDetails(logFile);
+              reportFile = path.join(logDir, `evolve-team-${runId}-verification-${verificationNumber}-failures.json`);
+              fs.writeFileSync(reportFile, JSON.stringify({ stage: check, logFile, ...details }), { mode: 0o600 });
+            } catch { /* Keep the original log even if structured extraction fails. */ }
+            const excerpt = safeReviewFeedback([...details.failedTests.slice(0, 6), ...details.errors.slice(0, 2)].join('; '), runtimeTerms);
             throw Object.assign(createTeamError('verification_failed', { exitCode: error.exitCode, signal: error.signal }),
-              { logFile, failureSummary: `${check}: ${excerpt || 'registered check failed'}` });
+              { logFile, reportFile, failureSummary: `${check}: ${details.counts.fail ?? details.failedCount} failed; ${excerpt || 'read the retained verification log'}` });
           }
           throw error;
         }
@@ -634,4 +675,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { inspectWorktree, validateResumeInput, main, executeStreaming, snapshotPrivateHandoff };
+module.exports = { inspectWorktree, validateResumeInput, main, executeStreaming, snapshotPrivateHandoff, readVerificationFailureDetails };
