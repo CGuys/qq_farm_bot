@@ -20,7 +20,7 @@ const crypto = require('node:crypto');
 const { execFileSync } = require('node:child_process');
 const { inspectWorktree } = require('./evolution-worktree');
 const { auditGitRange } = require('./privacy-guard');
-const { logicSnapshot } = require('./evolution-validation');
+const { logicSnapshot, getValidationSummary } = require('./evolution-validation');
 
 const WORKSPACE_DIR_NAME = 'tmp/evolution-workspaces';
 const RUN_ID_RE = /^[\w-]{1,100}$/;
@@ -377,9 +377,60 @@ function ensureLegacyShareFile({ repoRoot, dataDir }) {
  * 连续切换不覆盖旧根。内容身份用 logicSnapshot（当前内容+权限指纹）——
  * inspectWorktree 指纹只是 HEAD/status 哈希，捕获不了「干净树上的权限改动」。
  */
-function prepareRuntimeWorkspace({ repoRoot, runId, commit, dataDir = '', options = {} }) {
+function validatedModeSource(repoRoot, sourceRoot, commit, dataDir, options) {
+  if (!sourceRoot) return null;
+  const provenance = readProvenance(dataDir);
+  if (!provenance || provenance.taskRoot !== sourceRoot
+    || !verifyTaskWorkspace(repoRoot, provenance, { expectedHead: commit, env: options.env }).ok
+    || inspectWorktree(sourceRoot, { env: options.env }).dirty) throw publishError('mode_source_unverified');
+  const validation = getValidationSummary(dataDir);
+  const checks = fs.existsSync(path.join(sourceRoot, 'web/package.json')) ? 'backend,frontend' : 'backend';
+  if (validation.state !== 'passed' || validation.checks.join(',') !== checks
+    || validation.fingerprint !== logicSnapshot(sourceRoot).fingerprint) throw publishError('mode_source_not_validated');
+  return { root: sourceRoot, fingerprint: validation.fingerprint };
+}
+
+function matchValidatedModes(source, runtimeRoot, options) {
+  if (!source) return;
+  const regular = (root, relative) => {
+    const full = path.resolve(root, relative);
+    if (!relative || !full.startsWith(root + path.sep) || fs.realpathSync(root) !== root) throw publishError('mode_path_escape');
+    let current = root;
+    for (const part of relative.split('/')) {
+      current = path.join(current, part);
+      if (fs.lstatSync(current).isSymbolicLink()) throw publishError('mode_path_symlink');
+    }
+    const stat = fs.lstatSync(full);
+    if (!stat.isFile() || stat.nlink !== 1) throw publishError('mode_path_not_regular');
+    return { full, stat };
+  };
+  const files = String(pubGit(source.root, ['ls-files', '-z'], { env: options.env })).split('\0').filter(Boolean);
+  const plan = files.map(file => {
+    const from = regular(source.root, file); const to = regular(runtimeRoot, file);
+    if (!fs.readFileSync(from.full).equals(fs.readFileSync(to.full))) throw publishError('runtime_content_mismatch');
+    return { file, mode: from.stat.mode & 0o777, before: to.stat.mode & 0o777 };
+  });
+  // Build and validate the whole plan before the first chmod. Private runtime
+  // links/data are not tracked files and never enter this materialization plan.
+  if (logicSnapshot(source.root).fingerprint !== source.fingerprint) throw publishError('mode_source_changed');
+  for (const item of plan) {
+    if (item.mode === item.before) continue;
+    const { full, stat } = regular(runtimeRoot, item.file);
+    const fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== stat.dev || opened.ino !== stat.ino || !opened.isFile() || opened.nlink !== 1) throw publishError('mode_target_changed');
+      fs.fchmodSync(fd, item.mode);
+    } finally { fs.closeSync(fd); }
+  }
+  if (logicSnapshot(source.root).fingerprint !== source.fingerprint
+    || logicSnapshot(runtimeRoot).fingerprint !== source.fingerprint) throw publishError('runtime_validation_mismatch');
+}
+
+function prepareRuntimeWorkspace({ repoRoot, runId, commit, dataDir = '', options = {}, validatedSourceRoot = '' }) {
   if (!SHA_RE.test(String(commit || ''))) throw publishError('invalid_commit');
   const runtimeRoot = workspaceChildPath(repoRoot, runId, `runtime-${String(commit).slice(0, 12)}`);
+  const modeSource = validatedModeSource(repoRoot, validatedSourceRoot, commit, dataDir, options);
   // 幂等复用（B2 重启退回修复，2026-10-07）：自主应用启动后重启收口退回
   // pending_apply 是正常节奏（helper 失败/错误根），再次应用同一提交时既有运行时
   // 区仍是「干净 + 同 HEAD」的可证明工作区 → 直接复用，绝不因「已存在」把候选
@@ -390,6 +441,7 @@ function prepareRuntimeWorkspace({ repoRoot, runId, commit, dataDir = '', option
     try {
       const inspected = inspectWorktree(runtimeRoot, { env: options.env });
       if (inspected.head === commit && !inspected.dirty) {
+        matchValidatedModes(modeSource, runtimeRoot, options);
         const fingerprint = logicSnapshot(runtimeRoot).fingerprint;
         if (/^[0-9a-f]{64}$/.test(fingerprint)) {
           return { runtimeRoot, fingerprint: inspected.fingerprint, logicFingerprint: fingerprint };
@@ -406,6 +458,7 @@ function prepareRuntimeWorkspace({ repoRoot, runId, commit, dataDir = '', option
   if (dataDir) ensureLegacyShareFile({ repoRoot, dataDir });
   const inspected = inspectWorktree(runtimeRoot, { env: options.env });
   if (inspected.head !== commit || inspected.dirty) throw publishError('runtime_not_clean');
+  matchValidatedModes(modeSource, runtimeRoot, options);
   const logicFingerprint = logicSnapshot(runtimeRoot).fingerprint;
   if (!/^[0-9a-f]{64}$/.test(logicFingerprint)) throw publishError('runtime_content_unprovable');
   return { runtimeRoot, fingerprint: inspected.fingerprint, logicFingerprint };

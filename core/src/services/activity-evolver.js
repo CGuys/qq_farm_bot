@@ -947,8 +947,9 @@ function describeTeamFailure(collaboration) {
   return `${failure?.agent ? `${AGENT_LABELS[failure.agent]} ` : ''}${phase}阶段：${failure?.label || '未取得完整审批及验证结果'}；${budget}`;
 }
 
-function evolutionNotificationTitle(task, outcome) {
+function evolutionNotificationTitle(task, outcome, automaticApply = false) {
   const tag = task === 'safety' ? '安全巡检' : '活动进化';
+  if (outcome === 'pending_apply' && automaticApply) return `农场 bot ${tag}协作完成`;
   const suffix = { pending_apply: '待确认', review_blocked: '验收未通过',
     privacy_blocked: '被隐私闸门拦截', privacy_blocked_local: '被隐私闸门拦截',
     push_failed: '推送失败', interrupted: '已中止' }[outcome] || '结果';
@@ -1456,8 +1457,7 @@ async function notify(title, content, options = {}) {
   if (state.dualAgentEnabled === true) {
     if (options.finalApproved !== true || state.collaboration?.repairOnly
       || !['no_change', 'pending_apply', 'applied'].includes(state.status)
-      || !isTeamResultApproved(state.collaboration, state.commit || gitHead())
-      || (state.status === 'pending_apply' && state.autonomousEvolutionEnabled === true)) return;
+      || !isTeamResultApproved(state.collaboration, state.commit || gitHead())) return;
   }
   // 直推默认飞书 webhook；store 配了非飞书的 webhook 则改走 pushoo
   try {
@@ -2061,7 +2061,7 @@ function launchEvolution(task, payload = {}) {
     writeState(next);
     const notificationContent = [next.summary, next.collaboration?.mainSummary, next.changeSummary, ...next.privacyFindings].filter(Boolean).join('\n');
     await notify(
-      evolutionNotificationTitle(task, outcome),
+      evolutionNotificationTitle(task, outcome, next.autonomousEvolutionEnabled === true),
       task === 'safety' ? notificationContent
         : `${notificationContent}\n新活动: ${payload.newUnknown.join(',') || '无'}；结束: ${payload.newEnded.join(',') || '无'}；复核: ${payload.reviewIds.join(',') || '无'}`,
       { finalApproved: settings.dualAgentEnabled && isTeamResultApproved(teamJournal, headAfter) },
@@ -2526,7 +2526,7 @@ function applyEvolution(source = 'manual') {
     try {
       const runtime = evolutionPublish.prepareRuntimeWorkspace({
         repoRoot: evolutionPublish.ownerStorageRoot(dataDir, REPO_ROOT),
-        runId: provenance.runId, commit: headNow, dataDir,
+        runId: provenance.runId, commit: headNow, dataDir, validatedSourceRoot: applyRoot,
       });
       targetRoot = runtime.runtimeRoot;
       evolutionPublish.recordApplyTarget(dataDir, {
@@ -2709,9 +2709,9 @@ function schedulePushRetry(commit, delayMs = PUSH_RETRY_DELAY_MS) {
       : `进化提交 ${commit.slice(0, 8)} 已在自动重试后核对到 GitHub origin/main，待确认应用`;
     settleDailyReview(latest);
     writeState(latest);
-    scheduleAutonomyFromState();
     await notify('农场 bot 进化推送已恢复', [latest.summary, latest.changeSummary].filter(Boolean).join('\n'),
       { finalApproved: isTeamResultApproved(latest.collaboration, commit) });
+    scheduleAutonomyFromState();
     // 重推收口后同样进入反馈回复链路（发布核对在发送前还会再做一次）。
     void githubFeedback.handlePublishedEvolution({
       status: 'pending_apply',
@@ -3132,7 +3132,7 @@ async function finalizeRecoveredEvolution(activeRun, signal = 'parent_restart') 
   next.privacyFindings = privacyBlocked ? (pushResult.findings || []).slice(0, 20) : [];
   next.status = outcome === 'privacy_blocked' ? 'privacy_blocked_local' : outcome;
   next.summary = outcome === 'pending_apply'
-    ? `${tag}（${agentLabel}）已从主进程重启中恢复收口，并核对 GitHub origin/main，待确认应用（提交 ${headAfter.slice(0, 8)}）`
+    ? `${tag}（${agentLabel}）已从主进程重启中恢复收口，并核对 GitHub origin/main，${next.autonomousEvolutionEnabled === true ? '将自动应用，无需手动确认' : '待确认应用'}（提交 ${headAfter.slice(0, 8)}）`
     : outcome === 'push_failed'
       ? `${tag}（${agentLabel}）已恢复本地提交，但 GitHub 推送/远端校验失败（${pushResult.error}）`
       : outcome === 'privacy_blocked'

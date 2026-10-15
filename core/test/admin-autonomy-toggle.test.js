@@ -324,7 +324,8 @@ test('面板：自主进化按钮真实 POST 开关端点并同步服务端状�
   assert.deepEqual(api.calls.post[0].body, { enabled: true }, '关闭状态下点击应请求开启');
   await waitFor(() => textOf(root).includes('自主进化：开'), '同步服务端开启状态');
   assert.ok(textOf(root).includes('下次自动处理'), '开启且有退避剩余时应展示下次自动处理时刻');
-  assert.ok(textOf(root).includes('自动应用，就绪后通知'), '开启后说明自动应用并在实际就绪后通知');
+  assert.ok(textOf(root).includes('验收通过先通知'), '协作通过先发通知');
+  assert.ok(textOf(root).includes('自动应用，就绪后再确认'), '开启后自动应用并在实际就绪后确认');
 
   click(buttonsOf(root).find(node => textOf(node).includes('自主进化')));
   await waitFor(() => api.calls.post.length === 2, '第二次点击发出 POST');

@@ -46,7 +46,7 @@ function fixture() {
         },
     });
     // notify/readState/writeState already exist in the old implementation too.
-    vm.runInContext(`${fs.readFileSync(file, 'utf8')}\nmodule.exports.testAccess={notify,writeState};`, context, { filename: file });
+    vm.runInContext(`${fs.readFileSync(file, 'utf8')}\nmodule.exports.testAccess={notify,writeState,evolutionNotificationTitle};`, context, { filename: file });
     return { ...module.exports.testAccess, sent, local };
 }
 
@@ -69,18 +69,20 @@ test('even an approved state cannot send an intermediate notification', async ()
     assert.equal(f.sent.length, 1);
 });
 
-test('automatic publication waits for the real application completion, manual publication can request application', async () => {
+test('approved collaboration notifies before automatic application and confirms readiness afterward', async () => {
     const f = fixture();
     for (const autonomous of [true, false]) {
         f.writeState({ status: 'pending_apply', dualAgentEnabled: true, commit: HEAD,
             autonomousEvolutionEnabled: autonomous, collaboration: approved });
         await f.notify('活动进化结果', '已验收待应用', { finalApproved: true });
-        assert.equal(f.sent.length, autonomous ? 0 : 1);
+        assert.equal(f.sent.length, autonomous ? 1 : 2);
     }
     f.writeState({ status: 'applied', dualAgentEnabled: true, commit: HEAD,
         autonomousEvolutionEnabled: true, collaboration: approved });
     await f.notify('活动进化已应用', '真实运行已就绪', { finalApproved: true });
-    assert.equal(f.sent.length, 2);
+    assert.equal(f.sent.length, 3);
+    assert.equal(f.evolutionNotificationTitle('activity', 'pending_apply', true), '农场 bot 活动进化协作完成');
+    assert.equal(f.evolutionNotificationTitle('activity', 'pending_apply', false), '农场 bot 活动进化待确认');
 });
 
 test('repairOnly, wrong head, unapproved and failed records cannot masquerade as a final result', async () => {
