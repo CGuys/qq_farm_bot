@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { storeToRefs } from 'pinia'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import BearActivityPanel from '@/components/activity/BearActivityPanel.vue'
-import ClaimAllPanel from '@/components/activity/ClaimAllPanel.vue'
-import SeasonRuleActivityPanel from '@/components/activity/SeasonRuleActivityPanel.vue'
+// 上一期 BearActivityPanel 已退役；只保留历史迁移定位，默认页面仅挂载当前奶茶面板。
+import MilkTeaActivityPanel from '@/components/activity/MilkTeaActivityPanel.vue'
+import type { MilkTeaQueryKind } from '@/stores/activity'
 import AdminActivityUpdatePanel from '@/components/admin/AdminActivityUpdatePanel.vue'
 import EvolutionAgentSettings from '@/components/admin/EvolutionAgentSettings.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
@@ -19,14 +19,12 @@ const evolutionStore = useEvolutionStore()
 const toast = useToastStore()
 const userStore = useUserStore()
 const { currentAccountId, currentAccount } = storeToRefs(accountStore)
-const { bearActivity, bearLoading, bearError, bearOperating } = storeToRefs(activityStore)
-const { wishActivity, wishLoading, wishError } = storeToRefs(activityStore)
-const { happyShareActivity, happyShareLoading, happyShareError } = storeToRefs(activityStore)
-const { seasonWishOperating } = storeToRefs(activityStore)
+const { milkTeaActivity, milkTeaLoading, milkTeaError, milkTeaOperating, milkTeaQueries } = storeToRefs(activityStore)
 const { claimAllRunning, claimAllStep, claimAllResults } = storeToRefs(activityStore)
 const { activityRetired } = storeToRefs(activityStore)
 const { evolve } = storeToRefs(evolutionStore)
 
+const operationFeedback = ref<any>(null)
 const showActivityAnalysis = ref(false)
 const showActivityManagement = ref(false)
 
@@ -34,98 +32,54 @@ const showActivityManagement = ref(false)
 let activityViewAlive = true
 
 // 已结束活动从默认页面删除；手动恢复只在展开活动管理后提供，不自动探测。
-const bearRetired = computed(() => activityRetired.value.bear != null)
-const wishRetired = computed(() => activityRetired.value.wish != null)
-const happyShareRetired = computed(() => activityRetired.value.happyShare != null)
-const RETIRED_LABELS = { bear: 'S3 萌宠', wish: '秋祈良愿', happyShare: '快乐不独享' } as const
-const retiredKinds = computed(() => (Object.keys(RETIRED_LABELS) as Array<keyof typeof RETIRED_LABELS>)
-  .filter(key => activityRetired.value[key] != null))
-const hasVisibleActivity = computed(() => !bearRetired.value || !wishRetired.value || !happyShareRetired.value)
-
+const milkTeaRetired = computed(() => activityRetired.value.milkTea != null)
+const RETIRED_LABELS = { milkTea: '奶茶热销中' } as const
+const retiredKinds = computed(() => milkTeaRetired.value ? ['milkTea'] as const : [])
+const hasVisibleActivity = computed(() => !milkTeaRetired.value)
+let viewGeneration = 0
 async function refreshAll() {
-  if (currentAccountId.value) {
-    await Promise.all([
-      activityStore.fetchBearActivity(String(currentAccountId.value)),
-      activityStore.fetchWishActivity(String(currentAccountId.value)),
-      activityStore.fetchHappyShareActivity(String(currentAccountId.value)),
-    ])
-  }
+  if (currentAccountId.value)
+    await activityStore.fetchMilkTeaActivity(String(currentAccountId.value))
 }
-
-// 下架/已取消的读取返回不是失败：普通刷新与操作后刷新对它们静默（零提示，也零请求）
 function isSilentReadResult(result: any) {
   return result?.retired === true || result?.unavailable === true || result?.cancelled === true
 }
-
-async function refreshBear() {
-  if (!currentAccountId.value)
+async function refreshMilkTea() {
+  const generation = viewGeneration
+  const result = await activityStore.fetchMilkTeaActivity(String(currentAccountId.value || ''))
+  if (!activityViewAlive || generation !== viewGeneration || isSilentReadResult(result))
     return
-  const result = await activityStore.fetchBearActivity(String(currentAccountId.value))
-  if (isSilentReadResult(result))
-    return
-  result?.ok ? toast.success('S3 萌宠只读状态已刷新') : toast.error(result?.error || 'S3 萌宠刷新失败')
+  result?.ok === true ? toast.success('奶茶状态已刷新') : toast.error(result?.error || '刷新失败')
 }
-
-async function operateBear(action: string, input: Record<string, unknown> = {}) {
-  if (!currentAccountId.value || bearOperating.value)
+async function queryMilkTea(kind: MilkTeaQueryKind, params: Record<string, unknown>) {
+  const generation = viewGeneration
+  const result = await activityStore.runMilkTeaQuery(kind, String(currentAccountId.value || ''), params)
+  if (!activityViewAlive || generation !== viewGeneration || isSilentReadResult(result))
     return
+  if (result?.ok !== true)
+    toast.error(result?.error || '查询失败')
+}
+async function operateMilkTea(action: string, input: Record<string, unknown> = {}) {
+  if (!currentAccountId.value || milkTeaOperating.value || claimAllRunning.value)
+    return
+  const generation = viewGeneration
   const runAccount = String(currentAccountId.value)
-  const result = await activityStore.operateBearPet(runAccount, action, input)
-  // 卸载/切账号（含往返，账号串恰好相等）后的旧操作回调直接静默：不弹提示、不启动新的页面刷新
-  if (!activityViewAlive || currentAccountId.value !== runAccount || isSilentReadResult(result))
+  const result = await activityStore.operateMilkTea(runAccount, action, input)
+  if (!activityViewAlive || generation !== viewGeneration || isSilentReadResult(result))
     return
-  if (result?.ok) {
-    const rewardCount = result.rewards?.length || 0
-    toast.success(`操作成功${rewardCount ? `，获得 ${rewardCount} 项奖励` : ''}`)
-    await refreshBear()
+  operationFeedback.value = result
+  if (result?.ok === true) {
+    toast.success(result?.message || '操作完成，请核对最新状态')
+    await refreshMilkTea()
   }
-  else if (!(result as any)?.retired) {
-    toast.error(result?.error || '操作失败')
-  }
-}
-
-async function refreshWish() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.fetchWishActivity(String(currentAccountId.value))
-  if (isSilentReadResult(result))
-    return
-  result?.ok ? toast.success('秋祈良愿只读状态已刷新') : toast.error(result?.error || '秋祈良愿刷新失败')
-}
-
-async function refreshHappyShare() {
-  if (!currentAccountId.value)
-    return
-  const result = await activityStore.fetchHappyShareActivity(String(currentAccountId.value))
-  if (isSilentReadResult(result))
-    return
-  result?.ok ? toast.success('快乐不独享只读状态已刷新') : toast.error(result?.error || '快乐不独享刷新失败')
-}
-
-// 秋祈良愿 / 快乐不独享手动操作：成功后刷新对应只读状态
-async function operateSeasonWish(action: string, input: Record<string, unknown> = {}) {
-  if (!currentAccountId.value || seasonWishOperating.value)
-    return
-  const runAccount = String(currentAccountId.value)
-  const result = await activityStore.operateSeasonWish(runAccount, action, input)
-  // 卸载/切账号（含往返，账号串恰好相等）后的旧操作回调直接静默：不弹提示、不启动新的页面刷新
-  if (!activityViewAlive || currentAccountId.value !== runAccount || isSilentReadResult(result))
-    return
-  if (result?.ok) {
-    const rewardText = result.rewards?.length
-      ? `，获得 ${result.rewards.map((r: { itemName: string, itemCount: number }) => `${r.itemName}×${r.itemCount}`).join('、')}`
-      : (result.grantedScore ? `，快乐值 +${result.grantedScore}` : '')
-    toast.success(`操作成功${rewardText}`)
-    await Promise.all([refreshWish(), refreshHappyShare()])
-  }
-  else if (!(result as any)?.retired) {
-    toast.error(result?.error || '操作失败')
+  else {
+    toast.error(result?.message || result?.error || '操作未确认成功，请刷新核对')
   }
 }
 
 // 一键领取：编排层只在 store 内复用已证实手动写入口；部分失败不提示全成功
 async function claimAll() {
-  if (!currentAccountId.value || claimAllRunning.value || seasonWishOperating.value || bearOperating.value)
+  if (!currentAccountId.value || claimAllRunning.value || milkTeaOperating.value)
     return
   const runAccount = String(currentAccountId.value)
   const result = await activityStore.runClaimAll(runAccount)
@@ -140,7 +94,7 @@ async function claimAll() {
 
 // 活动管理中的显式重新检查：只读所选活动一次；提示同样受页面存活 + 账号双守卫，
 // 切账号往返（字符串恰好相等）也靠读取代次作废，不弹旧生命周期提示
-async function recheck(kind: 'bear' | 'wish' | 'happyShare') {
+async function recheck(kind: 'milkTea') {
   if (!currentAccountId.value)
     return
   const runAccount = String(currentAccountId.value)
@@ -158,11 +112,14 @@ async function recheck(kind: 'bear' | 'wish' | 'happyShare') {
 // 页面卸载：停止一键领取后续请求，作废在飞读取（迟到响应不回填/不重建计时），旧响应不弹提示
 onBeforeUnmount(() => {
   activityViewAlive = false
+  ++viewGeneration
   activityStore.cancelClaimAll()
   activityStore.cancelActivityReads()
 })
 
 watch(currentAccountId, () => {
+  ++viewGeneration
+  operationFeedback.value = null
   showActivityManagement.value = false
   activityStore.clearActivityData()
   refreshAll()
@@ -201,7 +158,7 @@ onMounted(() => {
           </div>
         </div>
         <div class="flex min-w-0 flex-wrap items-center gap-2 xl:max-w-[68%] xl:justify-end">
-          <BaseButton variant="primary" :loading="bearLoading" :disabled="!currentAccountId" @click="refreshAll">
+          <BaseButton variant="primary" :loading="milkTeaLoading" :disabled="!currentAccountId" @click="refreshAll">
             刷新
           </BaseButton>
           <EvolutionAgentSettings v-if="userStore.isAdmin" dark />
@@ -223,36 +180,19 @@ onMounted(() => {
       请先选择账号，再查看活动数据。
     </div>
     <template v-else>
-      <div v-if="bearError && !bearRetired" class="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-300">
-        {{ bearError }}
-      </div>
-      <ClaimAllPanel
-        v-if="hasVisibleActivity"
-        :running="claimAllRunning" :disabled="!currentAccountId" :step="claimAllStep"
-        :results="claimAllResults" :has-operating="!!seasonWishOperating || !!bearOperating"
-        @claim="claimAll"
-      />
-      <BearActivityPanel v-if="!bearRetired" v-model:operating="bearOperating" :activity="bearActivity" :loading="bearLoading" @refresh="refreshBear" @operate="operateBear" />
-      <div v-if="wishError && !wishRetired" class="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-300">
-        {{ wishError }}
-      </div>
-      <SeasonRuleActivityPanel
-        v-if="!wishRetired"
-        :activity="wishActivity" :loading="wishLoading" kind="wish" :operating="seasonWishOperating"
-        heading="秋祈良愿 · 每日祈愿"
-        subtitle="每日祈愿领好运奖励 · 限定种子 / 烟花 / 盆栽 · 错过存储 5 日 · 邮件补发"
-        @refresh="refreshWish" @operate="operateSeasonWish"
-      />
-      <div v-if="happyShareError && !happyShareRetired" class="rounded-lg bg-red-50 px-4 py-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-300">
-        {{ happyShareError }}
-      </div>
-      <SeasonRuleActivityPanel
-        v-if="!happyShareRetired"
-        :activity="happyShareActivity" :loading="happyShareLoading" kind="happyShare" :operating="seasonWishOperating"
-        heading="快乐不独享 · 快乐值"
-        subtitle="每日领取 / 每日首次分享 / 好友快乐包链接 · 档位奖励（稚萌熊熊）"
-        @refresh="refreshHappyShare" @operate="operateSeasonWish"
-      />
+      <div v-if="milkTeaError && !milkTeaRetired" class="rounded bg-red-50 p-3 text-red-600">{{ milkTeaError }}</div>
+      <section v-if="hasVisibleActivity" class="rounded-lg bg-white p-4 shadow dark:bg-gray-800">
+        <h2>一键领取</h2><p>仅领取奶茶活动的每日快乐值与合格档位奖励；每项领取前重新校验资格。</p>
+        <button :disabled="claimAllRunning || !!milkTeaOperating" @click="claimAll">一键领取</button>
+        <button v-if="claimAllRunning" @click="activityStore.cancelClaimAll()">停止后续领取</button>
+        <p v-if="claimAllStep">{{ claimAllStep }}</p>
+        <p v-for="result in claimAllResults" :key="result.key">{{ result.label }} · {{ result.status === 'success' ? '成功' : result.status === 'failed' ? '失败' : '跳过' }} · {{ result.detail }}</p>
+      </section>
+      <section v-if="operationFeedback && !milkTeaRetired" class="rounded bg-white p-3 dark:bg-gray-800">
+        <p>{{ operationFeedback.message || operationFeedback.error || '操作回复已返回，请核对最新状态' }}</p>
+        <p v-for="(row, index) in operationFeedback.results || []" :key="index">槽位 {{ Number(row.slotIndex) + 1 }}：{{ row.success ? '已雇佣' : row.errorMsg || '未成功' }}</p>
+      </section>
+      <MilkTeaActivityPanel v-if="!milkTeaRetired" :key="String(currentAccountId)" :activity="milkTeaActivity" :loading="milkTeaLoading" :operating="milkTeaOperating || (claimAllRunning ? 'claimAll' : '')" :queries="milkTeaQueries" @refresh="refreshMilkTea" @query="queryMilkTea" @operate="operateMilkTea" />
       <p v-if="!hasVisibleActivity" class="rounded-lg bg-white p-8 text-center text-sm text-gray-500 dark:bg-gray-800">
         暂无进行中的活动。
       </p>
