@@ -744,7 +744,18 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
       if (diagnosis.decision !== 'repair') throw fail(createTeamError('diagnosis_stopped'), 'diagnose', settings.mainAgent);
       const allowedFiles = normalizeRepairFiles(diagnosis.allowedFiles);
       const allowed = new Set(allowedFiles);
-      approvedScope = allowedFiles;
+      // 实施中途崩溃（implement/repair 阶段 cli_exit 等）后的空范围只读诊断不能清掉
+      // 原批准范围：五个条件同时成立（本次范围为空、plan 已 approve、尚无成功完成的
+      // implement 记录、当前 approvedScope 非空、失败来自 implement/repair）时保留原
+      // approvedScope，让原实施重试/检查点续接在同一授权下重新进入 runImplement。
+      // 仅本恢复迭代的局部判断，不新增全局状态或检查点字段；authorizedFiles 的累计
+      // UNION 不是实施写权限，也不从旧摘要恢复已丢失的授权。
+      const pendingImplementationRetry = allowedFiles.length === 0
+        && completedPhases.get('plan')?.decision === 'approve'
+        && completedPhases.get('implement')?.decision !== 'implemented'
+        && !!approvedScope?.length
+        && ['implement', 'repair'].includes(failure.phase);
+      approvedScope = pendingImplementationRetry ? approvedScope : allowedFiles;
       for (const file of allowedFiles) authorizedFiles.add(file);
       const before = await inspect();
       if (allowedFiles.length && !before.fileFingerprints) throw fail(createTeamError('repair_scope'), 'repair', settings.subAgent);
@@ -761,6 +772,12 @@ async function runTeamWorkflow({ settings, prompt, runStage, inspect, verify, co
           }
         }
         if (repairError) throw repairError;
+        // 空范围只读修复收口且原实施尚未完成：半成品树不是可验证候选，此时提前
+        // verifyCurrent 只会把实施中间态当验证失败处理（并连带空范围把后续实施写入
+        // 误判越权）。直接返回给 recover 的调用方，让原 retry 或检查点续接重新进入
+        // runImplement；不登记 implement 完成、不产生验证通过记录、不触发
+        // repair_review——真实验证仍由完成后的 finish→verifyCurrent 按原反证合同执行。
+        if (pendingImplementationRetry) return;
         await verifyCurrent();
         // In the lean flow, the original final review accepts the repaired tree once.
         // Separate repair_review remains only for legacy in-flight workflows.

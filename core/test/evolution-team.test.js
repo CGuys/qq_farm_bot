@@ -1076,6 +1076,299 @@ test('初始 CLI 失败→只读修复→验证失败：必须新诊断给出写
 });
 
 // ---------------------------------------------------------------------------
+// 实施中途崩溃的空范围只读修复（2026-10-15 journal：implement/cli_exit 后诊断返回
+// 空范围）。旧实现在 recover 里无条件 approvedScope=allowedFiles，把原批准范围清成空：
+// 重试实施必然 repair_scope，半成品树还会被提前 verifyCurrent 当验证失败处理。修复后
+// 五条件同时成立才保留原范围并直接返回（跳过提前验证），完成后的真实验证不减免。
+const emptyDiagnosis = { decision: 'repair', summary: '空范围只读核对后按原批准范围继续实施', allowedFiles: [] };
+const cliExit = (phase = 'implement') => normalizeTeamFailure(createTeamError('cli_exit', { exitCode: 1 }), phase, 'claude');
+
+test('实施中途 CLI 崩溃→空范围只读修复保留原批准范围→重新实施后完整验证', async () => {
+  for (const halfDone of [false, true]) {
+    const f = instructionFixture();
+    const stage = f.deps.runStage;
+    const records = [];
+    let attempts = 0;
+    const verifyContracts = [];
+    f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+    f.deps.runStage = async (phase, agent, prompt) => {
+      if (phase === 'diagnose') return { ...emptyDiagnosis };
+      if (phase === 'implement') {
+        attempts += 1;
+        assert.equal(actualHandoffs(prompt).find(item => item.phase === 'plan' && item.decision === 'approve').summary, approvalBrief);
+        if (attempts === 1) {
+          if (halfDone) f.setTree({ dirty: true, fingerprint: 'half',
+            files: [instructionContract.allowedFiles[0]],
+            fileFingerprints: { [instructionContract.allowedFiles[0]]: 'a'.repeat(64) } });
+          throw createTeamError('cli_exit', { exitCode: 1 });
+        }
+      }
+      if (phase === 'repair') return { decision: 'no_change', summary: '只读核对完成，原实施授权继续有效' };
+      return stage(phase, agent, prompt);
+    };
+    f.deps.verify = async contract => verifyContracts.push(jsonRoundtrip(contract));
+    const result = await runTeamWorkflow(f.deps);
+    assert.equal(result.decision, 'approve');
+    assert.equal(result.runtimeRecoveryAttempt, 1);
+    assert.equal(result.reviewRecoveryAttempt, 0);
+    assert.deepEqual(f.calls.map(([phase]) => phase), ['research', 'plan', 'implement', 'diagnose', 'repair',
+      'implement', 'verify', 'review', 'commit', 'git-commit']);
+    const implementIndexes = f.calls.map(([phase], index) => [phase, index]).filter(([phase]) => phase === 'implement');
+    assert.equal(implementIndexes.length, 2);
+    assert.ok(f.calls.slice(implementIndexes[0][1] + 1, implementIndexes[1][1])
+      .every(([phase]) => !['verify', 'tests', 'review', 'commit'].includes(phase)), '实施完成前不得对干净树或半成品提前验证');
+    assert.deepEqual(verifyContracts.map(contract => contract.baselineChecks), [instructionContract.baselineChecks],
+      '最终验证收到原反证合同');
+    const afterRepair = normalizeCheckpoint(records.find(value => value.completed.some(item => item.phase === 'repair')));
+    assert.ok(afterRepair);
+    assert.deepEqual(afterRepair.approvedScope, [...instructionContract.allowedFiles].sort(), '空范围只读诊断不得清掉原批准范围');
+    assert.deepEqual(afterRepair.baselineChecks, instructionContract.baselineChecks);
+    assert.deepEqual(afterRepair.acceptanceChecks, instructionContract.acceptanceChecks);
+    assert.equal(afterRepair.completed.some(item => item.phase === 'implement'), false, '未登记 implement 完成');
+    assert.equal(afterRepair.counters.runtimeRecoveryAttempt, 1);
+  }
+});
+
+test('只读修复收口后的检查点可同轮续接：原范围、合同、反证与剩余预算完整保留', async () => {
+  const f = instructionFixture();
+  const stage = f.deps.runStage;
+  let captured;
+  let interrupted = false;
+  let attempts = 0;
+  f.deps.onCheckpoint = async value => {
+    if (!interrupted && value.completed.some(item => item.phase === 'repair')) {
+      interrupted = true;
+      captured = jsonRoundtrip(value);
+      throw createTeamError('unsafe_worktree');
+    }
+  };
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'diagnose') return { ...emptyDiagnosis };
+    if (phase === 'implement' && ++attempts === 1) throw createTeamError('cli_exit', { exitCode: 1 });
+    if (phase === 'repair') return { decision: 'no_change', summary: '只读核对完成' };
+    return stage(phase, agent, prompt);
+  };
+  await assert.rejects(runTeamWorkflow(f.deps), { code: 'unsafe_worktree' });
+  const checkpoint = normalizeCheckpoint(captured);
+  assert.ok(checkpoint);
+  assert.deepEqual(checkpoint.approvedScope, [...instructionContract.allowedFiles].sort());
+  assert.deepEqual(checkpoint.acceptanceChecks, instructionContract.acceptanceChecks);
+  assert.deepEqual(checkpoint.baselineChecks, instructionContract.baselineChecks);
+  assert.equal(checkpoint.counters.runtimeRecoveryAttempt, 1);
+  assert.equal(checkpoint.completed.some(item => item.phase === 'implement'), false);
+  const verifyContracts = [];
+  const callsBeforeResume = f.calls.length;
+  f.deps.onCheckpoint = async () => {};
+  f.deps.verify = async contract => verifyContracts.push(jsonRoundtrip(contract));
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'diagnose') return { ...emptyDiagnosis };
+    if (phase === 'implement' || phase === 'repair') assertResumedContract(actualHandoffs(prompt));
+    if (phase === 'repair') return { decision: 'no_change', summary: '只读核对完成' };
+    return stage(phase, agent, prompt);
+  };
+  const result = await runTeamWorkflow({ ...f.deps, resume: jsonRoundtrip(checkpoint), initialFailure: cliExit() });
+  assert.equal(result.decision, 'approve');
+  assert.equal(result.runtimeRecoveryAttempt, 2, '同轮续接真实消耗剩余恢复次数');
+  assert.deepEqual(verifyContracts.map(contract => contract.baselineChecks), [instructionContract.baselineChecks]);
+  assert.equal(f.calls.filter(([phase]) => phase === 'research').length, 1, '不重复 research');
+  assert.equal(f.calls.filter(([phase]) => phase === 'plan').length, 1, '不重复 plan');
+  assert.deepEqual(f.calls.slice(callsBeforeResume).map(([phase]) => phase),
+    ['diagnose', 'repair', 'implement', 'verify', 'review', 'commit', 'git-commit']);
+});
+
+test('空范围 repair 自身再次崩溃后成功：原范围保留、恢复次数真实消耗且有界', async () => {
+  const f = instructionFixture();
+  const stage = f.deps.runStage;
+  const records = [];
+  let repairs = 0;
+  let attempts = 0;
+  f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'diagnose') return { ...emptyDiagnosis };
+    if (phase === 'implement' && ++attempts === 1) throw createTeamError('cli_exit', { exitCode: 1 });
+    if (phase === 'repair' && ++repairs === 1) throw createTeamError('cli_exit', { exitCode: 1 });
+    if (phase === 'repair') return { decision: 'no_change', summary: '只读核对完成' };
+    return stage(phase, agent, prompt);
+  };
+  const result = await runTeamWorkflow(f.deps);
+  assert.equal(result.decision, 'approve');
+  assert.equal(result.runtimeRecoveryAttempt, 2, '两次恢复真实计数');
+  assert.deepEqual(normalizeCheckpoint(records.at(-1)).approvedScope, [...instructionContract.allowedFiles].sort());
+
+  const bounded = instructionFixture();
+  const boundedStage = bounded.deps.runStage;
+  bounded.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'diagnose') return { ...emptyDiagnosis };
+    if (phase === 'implement' || phase === 'repair') throw createTeamError('cli_exit', { exitCode: 1 });
+    return boundedStage(phase, agent, prompt);
+  };
+  await assert.rejects(runTeamWorkflow(bounded.deps), error => error.code === 'recovery_exhausted' && error.failure.code === 'cli_exit');
+  assert.ok(bounded.calls.every(([phase]) => !['verify', 'review', 'commit'].includes(phase)));
+});
+
+test('越权路径继续拒绝：空范围 repair 写文件、实施越权写、HEAD 变化均不得验证或提交', async () => {
+  for (const variant of ['readonly-write', 'implement-out-of-scope', 'head-changed']) {
+    const f = instructionFixture();
+    const stage = f.deps.runStage;
+    f.deps.runStage = async (phase, agent, prompt) => {
+      if (phase === 'diagnose') return { ...emptyDiagnosis };
+      if (phase === 'implement' && variant !== 'readonly-write') {
+        if (variant === 'implement-out-of-scope') f.setTree({ dirty: true, fingerprint: 'out-of-scope',
+          files: ['core/src/unapproved.js'], fileFingerprints: { 'core/src/unapproved.js': 'x'.repeat(64) } });
+        if (variant === 'head-changed') f.setTree({ head: 'c'.repeat(40) });
+        if (variant === 'implement-out-of-scope') return { decision: 'implemented', summary: '越权写入' };
+        throw createTeamError('cli_exit', { exitCode: 1 });
+      }
+      if (phase === 'implement') throw createTeamError('cli_exit', { exitCode: 1 });
+      if (phase === 'repair' && variant === 'readonly-write') {
+        f.writeApproved();
+        return { decision: 'no_change', summary: '声称只读' };
+      }
+      if (phase === 'repair') return { decision: 'no_change', summary: '只读核对完成' };
+      return stage(phase, agent, prompt);
+    };
+    await assert.rejects(runTeamWorkflow(f.deps), { code: variant === 'head-changed' ? 'head_changed' : 'repair_scope' });
+    assert.ok(f.calls.every(([phase]) => !['verify', 'review', 'commit'].includes(phase)), `${variant} 不得进入验证或提交`);
+  }
+});
+
+test('没有批准方案或失败不属于实施阶段时不保留范围：原验证恢复路径保持', async () => {
+  // ① 初始失败来自 implement 但没有任何 plan 批准凭据（独立维护入口形状）。
+  {
+    const files = {};
+    const calls = [];
+    const records = [];
+    const deps = {
+      settings: { mainAgent: 'codex', subAgent: 'claude', dualAgentEnabled: true },
+      prompt: 'fixture task', efficientMode: true, roundId: 'no-plan-round',
+      taskIdentity: { task: 'safety', promptDigest: 'e'.repeat(64), feedbackThroughAt: 1, automatic: true },
+      initialFailure: cliExit(),
+      inspect: async () => ({ head: 'a'.repeat(40), dirty: Object.keys(files).length > 0,
+        fingerprint: JSON.stringify(files), files: Object.keys(files), fileFingerprints: { ...files } }),
+      onProgress: async (phase, agent) => calls.push([phase, agent]),
+      onCheckpoint: async value => records.push(jsonRoundtrip(value)),
+      runStage: async (phase) => {
+        if (phase === 'diagnose') return { ...emptyDiagnosis };
+        if (phase === 'repair') return { decision: 'no_change', summary: '只读核对' };
+        if (phase === 'plan') return { decision: 'approve', summary: 'approved scope',
+          allowedFiles: ['core/src/example.js'], acceptanceChecks: ['example behavior'] };
+        if (phase === 'implement') { files['core/src/example.js'] = 'implemented'; return { decision: 'implemented', summary: 'done' }; }
+        if (phase === 'review') return { decision: 'approve', summary: 'final review' };
+        return { decision: 'researched', summary: 'researched' };
+      },
+      verify: async () => calls.push(['tests']),
+      commit: async () => 'b'.repeat(40),
+    };
+    const result = await runTeamWorkflow(deps);
+    assert.equal(result.decision, 'approve');
+    assert.deepEqual(calls.map(call => call[0]), ['diagnose', 'repair', 'research', 'plan', 'implement', 'verify', 'tests', 'review', 'commit']);
+    const afterRepair = normalizeCheckpoint(records.find(value => value.completed.some(item => item.phase === 'repair')));
+    assert.ok(afterRepair);
+    assert.deepEqual(afterRepair.approvedScope, [], '没有批准方案时空范围诊断不产生任何保留范围');
+  }
+  // ② 实施已完成后的验证类失败：不进入延期分支，验证真实重跑。
+  {
+    const f = instructionFixture();
+    const stage = f.deps.runStage;
+    const records = [];
+    let verifyCalls = 0;
+    f.deps.onCheckpoint = async value => records.push(jsonRoundtrip(value));
+    f.deps.verify = async contract => {
+      verifyCalls += 1;
+      assert.deepEqual(contract.baselineChecks, instructionContract.baselineChecks);
+      if (verifyCalls === 1) throw createTeamError('cli_exit', { exitCode: 1 });
+    };
+    f.deps.runStage = async (phase, agent, prompt) => {
+      if (phase === 'diagnose') return { ...emptyDiagnosis };
+      if (phase === 'repair') return { decision: 'no_change', summary: '只读核对完成' };
+      return stage(phase, agent, prompt);
+    };
+    const result = await runTeamWorkflow(f.deps);
+    assert.equal(result.decision, 'approve');
+    assert.equal(verifyCalls, 2, '验证失败后必须重新真实验证，不能被延期分支跳过');
+    const afterRepair = normalizeCheckpoint(records.find(value => value.completed.some(item => item.phase === 'repair')));
+    assert.ok(afterRepair);
+    assert.deepEqual(afterRepair.approvedScope, [], '验证阶段失败维持原范围更新行为');
+  }
+});
+
+test('实施续接后的最终验证失败与最终复核拒绝不被空范围修复跳过', async () => {
+  const f = instructionFixture();
+  const stage = f.deps.runStage;
+  let attempts = 0;
+  let repairs = 0;
+  let verifyCalls = 0;
+  let reviews = 0;
+  const repairHandoffs = [];
+  f.deps.verify = async contract => {
+    verifyCalls += 1;
+    assert.deepEqual(contract.baselineChecks, instructionContract.baselineChecks);
+    if (verifyCalls === 1) throw createTeamError('verification_failed');
+  };
+  f.deps.runStage = async (phase, agent, prompt) => {
+    if (phase === 'diagnose') return { ...emptyDiagnosis };
+    if (phase === 'implement' && ++attempts === 1) throw createTeamError('cli_exit', { exitCode: 1 });
+    if (phase === 'repair') {
+      repairHandoffs.push(actualHandoffs(prompt));
+      if (++repairs === 1) return { decision: 'no_change', summary: '只读核对完成' };
+    }
+    if (phase === 'review' && ++reviews === 1) return { decision: 'reject', summary: rejectionBrief };
+    return stage(phase, agent, prompt);
+  };
+  const result = await runTeamWorkflow(f.deps);
+  assert.equal(result.decision, 'approve');
+  assert.equal(verifyCalls, 2, '实施完成后的真实验证必须执行');
+  assert.equal(reviews, 2);
+  assert.equal(result.runtimeRecoveryAttempt, 1);
+  assert.equal(result.reviewRecoveryAttempt, 2);
+  assert.equal(result.reviewFeedback, '');
+  const late = repairHandoffs.at(-1);
+  assert.equal(late.find(item => item.phase === 'review' && item.decision === 'reject').summary, rejectionBrief);
+  assert.equal(late.findLast(item => item.code === 'review_rejected' && item.attempt)?.reviewFeedback, rejectionBrief,
+    '未决最终拒绝随失败交接保留到返工');
+});
+
+test('独立维护入口：真实 diagnose 批准编排文件→repair 补丁→验证收到精确编排授权→唯一 patch_review', async () => {
+  const files = {};
+  const calls = [];
+  const verifyContracts = [];
+  const deps = {
+    settings: { mainAgent: 'codex', subAgent: 'claude', dualAgentEnabled: true },
+    prompt: 'maintenance task', efficientMode: true,
+    initialFailure: cliExit(),
+    inspect: async () => ({ head: 'a'.repeat(40), dirty: Object.keys(files).length > 0,
+      fingerprint: JSON.stringify(files), files: Object.keys(files), fileFingerprints: { ...files } }),
+    onProgress: async (phase, agent) => calls.push([phase, agent]),
+    runStage: async (phase) => {
+      if (phase === 'diagnose') return { decision: 'repair', summary: '修复恢复编排',
+        allowedFiles: ['core/src/services/evolution-team.js', 'core/test/evolution-team.test.js', 'docs/HANDOFF.md'] };
+      if (phase === 'repair') {
+        files['core/src/services/evolution-team.js'] = 'patched';
+        files['core/test/evolution-team.test.js'] = 'patched';
+        files['docs/HANDOFF.md'] = 'patched';
+        return { decision: 'implemented', summary: '编排补丁完成' };
+      }
+      if (phase === 'patch_review') return { decision: 'approve', summary: '补丁验收通过' };
+      throw new Error(`unexpected phase ${phase}`);
+    },
+    verify: async contract => verifyContracts.push(jsonRoundtrip(contract)),
+    commit: async () => 'b'.repeat(40),
+  };
+  const result = await runTeamWorkflow(deps);
+  assert.equal(result.decision, 'approve');
+  assert.equal(result.repairOnly, true);
+  assert.deepEqual(calls.map(call => call[0]), ['diagnose', 'repair', 'verify', 'patch_review', 'commit']);
+  assert.ok(calls.every(([phase]) => !['research', 'plan', 'implement', 'review', 'repair_review'].includes(phase)),
+    '业务 research/implement/review 不借维护补丁完成');
+  assert.deepEqual(verifyContracts, [{ reviewedOrchestrationFiles: ['core/src/services/evolution-team.js'],
+    baselineChecks: [], baseCommit: 'a'.repeat(40) }], '验证收到精确编排授权与空基线反证');
+  assert.deepEqual(result.reviewedOrchestrationFiles, ['core/src/services/evolution-team.js']);
+  assert.deepEqual(result.lessons, []);
+  assert.deepEqual(result.githubResolutions, []);
+  assert.equal(result.feedbackReviewed, false, '仅修复编排时反馈复核保持 false');
+});
+
+// ---------------------------------------------------------------------------
 // Fresh stages accept valid outputs independently of native IDs.
 test('真实 runner：大事件、无原生 ID 与失败恢复均使用独立新会话', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'farm-team-session-'));
