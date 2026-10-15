@@ -180,7 +180,7 @@ test('legacy successful and failed runs migrate their historical date before lat
     assert.equal(f.launches.length, 0);
 });
 
-test('scan callbacks only merge pending activity and never launch an Agent', (t) => {
+test('autonomy disabled: scan callbacks persist pending activity without launching an Agent', (t) => {
     const f = harness(t, { state: { handledUnknownIds: [11], handledEndedIds: [21], lastAutomaticEvolveDate: FIRST_DAY } });
     const report = { status: 'ok', unknownActivityIds: [11, 12], endedActivityIds: [21, 22] };
     f.service.checkAndMaybeEvolve(report);

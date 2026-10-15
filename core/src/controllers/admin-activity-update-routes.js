@@ -171,7 +171,7 @@ function registerAdminActivityUpdateRoutes({ app, provider, store, requireAdminT
     knownActivityIds,
     onlineScanner: scanOnlineActivities,
     localScanEnabled: String(process.env.ACTIVITY_LOCAL_SCAN_ENABLED || '').toLowerCase() === 'true',
-    // 每次扫描后把报告交给进化服务：发现新活动/活动结束时每日最多触发一次代码进化
+    // 每次扫描登记新/结束活动；自主开启时空闲后立即进化，同批去重，不占每日名额。
     onReport: report => activityEvolver.checkAndMaybeEvolve(report),
   });
   activityEvolver.startActivityEvolver({ store });

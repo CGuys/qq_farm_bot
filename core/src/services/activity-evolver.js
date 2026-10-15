@@ -172,8 +172,10 @@ function defaultState() {
     // 本次应用的来源（autonomous/manual）：重启收口据此选择严格同提交或祖先包含核对。
     applyingSource: 'manual',
     pendingActivity: null,
+    // 自动活动事件与每日名额独立；启动前持久去重，扫描/重启不重开失败批次。
+    activityEventFingerprints: [],
     // 面板可展示的固定自动调度说明；UI 未接也可正常工作。
-    automaticPolicy: '每天最多自动启动一轮综合巡检（北京时间 00:00-01:00，安全巡检 + 缓存活动增量交给同一 Agent 团队）；失败不自动重跑，重启不重跑；手动按钮独立执行，不消费自动名额',
+    automaticPolicy: '每日综合巡检北京时间 00:00-01:00 最多一轮；自主进化开启后，新活动和结束活动空闲时立即进化，同批事件去重；手动按钮独立，不消费每日名额',
     lastTask: '',
     lastRunAt: 0,
     status: 'idle', // idle | running | revising | rejected | revision_failed | pending_apply | applying | applied | push_failed | privacy_blocked | privacy_blocked_local | failed | interrupted | deferred | no_change
@@ -286,6 +288,8 @@ function normalizePersistedState(value, now = Date.now()) {
   state.applyingSource = state.applyingSource === 'autonomous' ? 'autonomous' : 'manual';
   state.autonomy = state.autonomy ? normalizeAutonomy(state.autonomy) : null;
   state.pendingActivity = normalizePendingActivity(state.pendingActivity);
+  state.activityEventFingerprints = [...new Set((Array.isArray(state.activityEventFingerprints)
+    ? state.activityEventFingerprints : []).filter(value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)))].slice(-200);
   state.userInstruction = normalizeEvolutionInstruction(state.userInstruction);
   state.revisionContext = normalizeRevisionContext(state.revisionContext);
   state.changeSummary = String(state.changeSummary || '').slice(0, 3500);
@@ -1202,6 +1206,7 @@ function buildEvolutionGuardrails(userInstruction = '', revisionContext = null) 
   const guardrails = `【执行顺序硬门（全新会话有界上下文）】
 ${FULL_HANDOFF_MANDATE}
 先把摘录中的「用户硬约束」「踩过的坑」「不要做的」「风险待处理」与最新巡检记录过一遍再动手；需要更早的证据时按标题锚点检索 docs/HANDOFF.md 对应章节原文，不得以摘录宣称已覆盖全文。
+官方版本、公告/玩法或活动证据变化时，先按已用接口和实际调用链核对现有响应字段/结构、错误码、推送类型及鉴权、限流、校验信号的增量变化；使用既有日志、官方资源和自然回包取证。普通错误或一次失败不能推断新增检测机制；缺少证据如实待证，不新增探针、不绕过校验，也不得为覆盖制造游戏写请求。
 
 【历史踩坑回归硬门（优先级高于本轮优化目标）】
 1. docs/HANDOFF.md 不只是说明文档，而是回归约束清单。修改前列出会影响的既有不变量，修改后逐项确认没有改回历史错误。
@@ -1478,7 +1483,7 @@ function settleCombinedActivityMemory(next, { newUnknown = [], newEnded = [], fi
 
 function getCapturedActivityPlan(current) {
   return normalizeActivityPlan(current.autonomy?.activityPlan)
-    || (current.activeRun?.combinedDaily ? normalizeActivityPlan({
+    || (current.activeRun && (current.activeRun.task === 'activity' || current.activeRun.combinedDaily) ? normalizeActivityPlan({
       newUnknown: current.activeRun.newUnknown, newEnded: current.activeRun.newEnded,
       reviewIds: current.activeRun.reviewIds, fingerprint: current.activeRun.evidenceFingerprint,
     }) : null);
@@ -1811,7 +1816,7 @@ function launchEvolution(task, payload = {}) {
   const runRoot = taskRoot || REPO_ROOT;
   const headBefore = gitHead(runRoot);
   const evidenceFingerprint = task === 'activity'
-    ? activityEvidenceFingerprint(payload.report)
+    ? ((preserveBatch && normalizeActivityPlan(payload.activityPlan)?.fingerprint) || activityEvidenceFingerprint(payload.report))
     : (payload.combinedDaily ? String(payload.activityPlan?.fingerprint || '') : '');
   // 单 Agent Claude 轮用 JSON stdout 捕获 session_id（重做时可 --resume 续接原对话）；
   // 其余模式沿用原全量日志输出。JSON 结果文本在收尾时回写日志，审计链不受影响。
@@ -1975,8 +1980,10 @@ function launchEvolution(task, payload = {}) {
       else next.lastEvolveDate = '';
     }
     if (task !== 'safety' && COMPLETED_STATUSES.has(outcome) && !teamJournal?.repairOnly) {
-      next.handledUnknownIds = [...new Set([...next.handledUnknownIds, ...payload.newUnknown])].slice(-200);
-      next.handledEndedIds = [...new Set([...next.handledEndedIds, ...payload.newEnded])].slice(-200);
+      settleCombinedActivityMemory(next, {
+        newUnknown: payload.newUnknown, newEnded: payload.newEnded,
+        fingerprint: evidenceFingerprint, head: evolved ? headAfter : headBefore,
+      });
     }
     // 综合巡检完成时同样结算活动侧检查点：只记 handled 与指纹，不伪造 lastEvolveDate。
     if (task === 'safety' && payload.combinedDaily
@@ -2125,11 +2132,7 @@ function planDailyActivityEvolution(report, state = {}) {
   };
 }
 
-/**
- * 每次监控扫描后调用：只把未处理的新活动/结束活动登记为待处理标记，
- * 供下一轮每日综合巡检合并进缓存活动增量上下文；扫描事件本身不自动拉 Agent。
- * handled 集合是事件去重依据；凌晨无候选空跑过不能吞掉当天稍后开放的新活动。
- */
+/** 扫描只登记并异步排队；每日名额不限制新活动，忙时等待原任务收口。 */
 function checkAndMaybeEvolve(report) {
   const state = (deps.readState || readState)();
   const { shouldRun, newUnknown, newEnded } = planActivityEvolution(report, state);
@@ -2146,10 +2149,83 @@ function checkAndMaybeEvolve(report) {
     && pending.newEnded.length === merged.newEnded.length
     && pending.newUnknown.every(id => merged.newUnknown.includes(id))
     && pending.newEnded.every(id => merged.newEnded.includes(id));
-  if (sameIds) return;
-  state.pendingActivity = merged;
-  (deps.writeState || writeState)(state);
-  logger.info(`发现待处理活动，已登记待下次每日综合巡检：新活动 ${merged.newUnknown.join(',')}；结束 ${merged.newEnded.join(',')}`);
+  if (!sameIds) {
+    state.pendingActivity = merged;
+    if (!(deps.writeState || writeState)(state)) return;
+    logger.info(`发现待处理活动，已排队空闲后进化：新活动 ${merged.newUnknown.length} 个；结束 ${merged.newEnded.length} 个`);
+  }
+  scheduleAutonomyFromState(state);
+}
+
+function pendingActivityEvent(state) {
+  if (state.autonomousEvolutionEnabled !== true || state.evolutionEnabled === false || running
+    || state.activeRun || !['idle', 'no_change', 'applied'].includes(state.status)
+    || (state.commit && state.status !== 'applied') || state.privacyBlockedCommit) return null;
+  if (planAutonomy(state, autonomyDeps()).action !== 'none') return null;
+  const report = (deps.readLatestReport || readLatestReport)();
+  if (!report || report.status === 'unavailable' || report.online?.available === false) return null;
+  const plan = planActivityEvolution(report, state);
+  if (!plan.shouldRun) return null;
+  // 只认新/结束候选集合，不把扫描时刻、进度、公告已读状态等波动当新事件。
+  const key = crypto.createHash('sha256').update(JSON.stringify({
+    newUnknown: [...plan.newUnknown].sort((a, b) => a - b),
+    newEnded: [...plan.newEnded].sort((a, b) => a - b),
+  })).digest('hex');
+  if ((state.activityEventFingerprints || []).includes(key)) return null;
+  return { report, key, plan: { ...plan, fingerprint: activityEvidenceFingerprint(report) } };
+}
+
+function schedulePendingActivityEvent(state) {
+  if (!pendingActivityEvent(state)) return;
+  scheduler.setTimeoutTask('activity_evolution_event', 0, () => {
+    const live = (deps.readState || readState)();
+    const event = pendingActivityEvent(live);
+    if (!event) return;
+    live.pendingActivity = normalizePendingActivity({
+      newUnknown: [...(live.pendingActivity?.newUnknown || []), ...event.plan.newUnknown],
+      newEnded: [...(live.pendingActivity?.newEnded || []), ...event.plan.newEnded],
+      updatedAt: (deps.now || Date.now)(),
+    });
+    live.activityEventFingerprints = [...(live.activityEventFingerprints || []), event.key].slice(-200);
+    const activityPlan = normalizeActivityPlan(event.plan);
+    const activityPlanDigest = crypto.createHash('sha256').update(JSON.stringify(activityPlan)).digest('hex');
+    // 已收口的旧任务不拥有本事件。先建立真实新链，启动前失败也不借旧 checkpoint。
+    live.lastTask = 'activity';
+    live.lastRunAutomatic = true;
+    live.combinedDaily = false;
+    live.collaboration = null;
+    live.commit = '';
+    live.candidateTaskRoot = '';
+    live.status = 'interrupted';
+    live.lastRunAt = (deps.now || Date.now)();
+    live.summary = '新活动事件准备启动，待处理项已保留';
+    live.autonomy = normalizeAutonomy({ activityPlan, activityPlanDigest, quotaDate: getLocalDateKey(live.lastRunAt) });
+    if (!(deps.writeState || writeState)(live)) return;
+    let result;
+    try {
+      result = (deps.launchEvolution || launchEvolution)('activity', {
+        automatic: true, report: event.report, activityPlan,
+        newUnknown: event.plan.newUnknown, newEnded: event.plan.newEnded, reviewIds: [],
+      });
+    } catch {
+      result = { ok: false, reason: 'launch_exception' };
+    }
+    if (result?.ok === false) {
+      const failed = (deps.readState || readState)();
+      if (failed.lastTask === 'activity' && failed.lastRunAutomatic === true
+        && failed.autonomy?.activityPlanDigest === activityPlanDigest
+        && !failed.activeRun && !failed.commit && !failed.privacyBlockedCommit
+        && ['idle', 'no_change', 'applied', 'failed', 'deferred', 'running', 'interrupted'].includes(failed.status)) {
+        running = false;
+        failed.status = 'failed';
+        autonomyDefer(failed, `launch:${result.reason || 'failed'}`,
+          `活动事件启动未成功（${result.reason || 'failed'}）；保留待处理项，按既有退避恢复原活动任务`);
+      } else {
+        logger.warn(`活动事件启动未成功（${result.reason || 'failed'}）；保留待处理项，现有任务或阻断继续拥有恢复流程`);
+        scheduleAutonomyFromState(failed);
+      }
+    }
+  });
 }
 
 /** 手动触发（面板按钮/验证用），跳过每日闸门。task: 'activity' | 'safety' */
@@ -2260,8 +2336,9 @@ function retryReviewBlockedEvolution(opts = {}) {
   // 不新增游戏扫描/枚举，不带 automatic:true（不消费自动名额，也不重置已消费名额）。
   const report = readLatestReport();
   const reportUsable = !!report && report.status !== 'unavailable' && report?.online?.available !== false;
-  const activityPlan = reportUsable ? planDailyActivityEvolution(report, state) : null;
-  if (activityPlan) {
+  const capturedActivityPlan = autonomous && state.lastTask === 'activity' ? getCapturedActivityPlan(state) : null;
+  const activityPlan = capturedActivityPlan || (reportUsable ? planDailyActivityEvolution(report, state) : null);
+  if (activityPlan && !capturedActivityPlan) {
     // 重试轮以复核为底线：即使指纹判断无变化，也覆盖当前 List 下发的活动根节点；
     // 下游 shouldRun 同步置真，保证 buildCachedActivityContext 与收口结算口径一致，
     // 不会出现 shouldRun=false 跳过活动复核但 UI 声称综合验收。
@@ -2276,16 +2353,20 @@ function retryReviewBlockedEvolution(opts = {}) {
   // 沿用，quotaDate 由 launchEvolution 回退到 lastAutomaticEvolveDate）；automatic
   // 身份不写手动日期；活动计划沿用缓存报告推导（不重扫描、digest 按链条保留）。
   const legacyFailure = autonomous ? legacyBlockedInitialFailure(state) : null;
-  const result = launch('safety', {
+  const retryTask = capturedActivityPlan ? 'activity' : 'safety';
+  const result = launch(retryTask, {
     manualReviewRetry: true,
     ...(autonomous ? {
       automatic: true,
-      preserveFeedbackBatch: true,
+      preserveFeedbackBatch: retryTask !== 'activity' || !!state.autonomy?.originalPrompt,
       ...(legacyFailure ? { legacyInitialFailure: legacyFailure } : {}),
     } : {}),
-    combinedDaily: true,
+    combinedDaily: retryTask === 'safety',
     report: reportUsable ? report : null,
     activityPlan,
+    ...(retryTask === 'activity' ? {
+      newUnknown: activityPlan.newUnknown, newEnded: activityPlan.newEnded, reviewIds: activityPlan.reviewIds,
+    } : {}),
   });
   if (result && result.ok === false) {
     logger.warn(`review_blocked 手动重试启动未成功（${result.reason || ''}）：${result.error || ''}`);
@@ -2618,10 +2699,14 @@ function autonomyDeps() {
  * 提交/新任务才立即执行一次。返回本次安排的延迟毫秒（0=未安排或立即）。 */
 function scheduleAutonomyFromState(source = readState()) {
   scheduler.clear('autonomy_rework');
+  scheduler.clear('activity_evolution_event');
   const state = source;
   if (state.autonomousEvolutionEnabled !== true || running) return 0;
   const plan = planAutonomy(state, autonomyDeps());
-  if (plan.action !== 'apply' && plan.action !== 'launch' && plan.action !== 'wait') return 0;
+  if (plan.action !== 'apply' && plan.action !== 'launch' && plan.action !== 'wait') {
+    schedulePendingActivityEvent(state);
+    return 0;
+  }
   const autonomy = normalizeAutonomy(state.autonomy);
   const now = (deps.now || Date.now)();
   const sameTarget = plan.action === 'apply'
@@ -2777,36 +2862,51 @@ async function runAutonomyStep() {
     autonomy.nextReworkAt = 0;
     state.autonomy = autonomy;
     if (!writeState(state)) return;
+    const capturedPlan = getCapturedActivityPlan(state);
+    const originalTask = state.lastTask === 'activity' ? 'activity' : 'safety';
+    const cachedReport = originalTask === 'activity' ? (deps.readLatestReport || readLatestReport)() : null;
+    const usableReport = cachedReport && cachedReport.status !== 'unavailable' && cachedReport.online?.available !== false;
     const automaticPayload = {
       automatic: true,
-      combinedDaily: true,
-      preserveFeedbackBatch: true,
+      combinedDaily: originalTask === 'activity' ? state.combinedDaily === true : true,
+      preserveFeedbackBatch: originalTask !== 'activity' || !!autonomy.originalPrompt,
       preferDiagnosis: autonomy.preferDiagnosis,
+      ...(originalTask === 'activity' ? { report: usableReport ? cachedReport : null } : {}),
+      ...(originalTask === 'activity' && capturedPlan ? {
+        activityPlan: capturedPlan, newUnknown: capturedPlan.newUnknown,
+        newEnded: capturedPlan.newEnded, reviewIds: capturedPlan.reviewIds,
+      } : {}),
     };
+    const launch = deps.launchEvolution || launchEvolution;
     let result;
     if (plan.kind === 'continue') {
       const continuation = plan.payload || {};
       // 活动计划沿用原批次记录（不重算替换）；report 按任务需要重读实时值。
       const continueTask = continuation.task === 'activity' ? 'activity' : 'safety';
-      const report = readLatestReport();
+      const report = (deps.readLatestReport || readLatestReport)();
       const reportUsable = !!report && report.status !== 'unavailable' && report?.online?.available !== false;
-      result = launchEvolution(continueTask, {
+      result = launch(continueTask, {
         ...automaticPayload,
-        combinedDaily: continuation.combinedDaily !== false,
+        combinedDaily: continueTask === 'activity' ? continuation.combinedDaily === true : continuation.combinedDaily !== false,
         report: reportUsable ? report : null,
         activityPlan: continuation.activityPlan || null,
+        ...(continueTask === 'activity' ? {
+          newUnknown: continuation.activityPlan?.newUnknown || [],
+          newEnded: continuation.activityPlan?.newEnded || [],
+          reviewIds: continuation.activityPlan?.reviewIds || [],
+        } : {}),
         resume: 'continuation',
         autonomyResume: true,
       });
     } else if (plan.kind === 'resume') {
-      result = launchEvolution('safety', { ...automaticPayload, resume: 'checkpoint', autonomyResume: true });
+      result = launch(originalTask, { ...automaticPayload, resume: 'checkpoint', autonomyResume: true });
     } else if (state.status === 'review_blocked') {
       // 无 checkpoint 的旧阻断轮（legacy）：以自主模式走 retryReviewBlocked 入口——
       // 前置硬门（干净/已同步）沿用，批次/水位/名额身份保留，旧底层失败注入首跳
       // 诊断；人工按钮的无参语义（全新综合重验）不变。
       result = (deps.retryReviewBlockedEvolution || retryReviewBlockedEvolution)({ autonomous: true });
     } else {
-      result = launchEvolution('safety', automaticPayload);
+      result = launch(originalTask, automaticPayload);
     }
     if (result && result.ok === false) {
       autonomyDefer(readState(), `launch:${result.reason || 'failed'}`,
@@ -2815,6 +2915,7 @@ async function runAutonomyStep() {
   } catch (error) {
     logger.warn(`自主进化步骤异常：${error.message}`);
     scheduler.clear('autonomy_rework');
+    scheduler.clear('activity_evolution_event');
     const latest = readState();
     latest.autonomy = { ...normalizeAutonomy(latest.autonomy),
       reworkAttempts: normalizeAutonomy(latest.autonomy).reworkAttempts + 1 };
@@ -2873,6 +2974,7 @@ function setAutonomousEvolution(enabled) {
   if (!state.autonomousEvolutionEnabled) {
     // 只撤自主定时器；正在执行的进化（有真实写入）不强停，按原流程收口。
     scheduler.clear('autonomy_rework');
+    scheduler.clear('activity_evolution_event');
   }
   writeState(state);
   if (state.autonomousEvolutionEnabled) scheduleAutonomyFromState(state);
@@ -2900,14 +3002,16 @@ function scheduleDailyEvolution() {
   });
 }
 
-/** 面板开关：是否启用自动自进化（安全巡检+活动进化的每日自动轮）。 */
+/** 面板总开关：每日综合巡检及新/结束活动的即时事件；手动按钮独立。 */
 function setEvolutionEnabled(enabled) {
   const state = readState();
   state.evolutionEnabled = enabled !== false;
   state.summary = state.evolutionEnabled
-    ? '自进化已开启：每日窗口（北京 00:00-01:00）自动巡检'
+    ? '自进化已开启：每日窗口自动巡检，自主开启时活动事件空闲后立即进化'
     : '自进化已关闭：跳过自动进化，面板手动触发仍可用';
   writeState(state);
+  if (state.evolutionEnabled) scheduleAutonomyFromState(state);
+  else scheduler.clear('activity_evolution_event');
   return { ok: true, enabled: state.evolutionEnabled };
 }
 
@@ -3029,8 +3133,10 @@ async function finalizeRecoveredEvolution(activeRun, signal = 'parent_restart') 
     next.revisionContext = null;
   }
   if (task === 'activity' && COMPLETED_STATUSES.has(next.status) && !teamJournal?.repairOnly) {
-    next.handledUnknownIds = [...new Set([...next.handledUnknownIds, ...active.newUnknown])].slice(-200);
-    next.handledEndedIds = [...new Set([...next.handledEndedIds, ...active.newEnded])].slice(-200);
+    settleCombinedActivityMemory(next, {
+      newUnknown: active.newUnknown, newEnded: active.newEnded,
+      fingerprint: active.evidenceFingerprint, head: evolved ? headAfter : active.baseCommit,
+    });
   }
   // 恢复收口的综合巡检同样结算活动侧检查点，不伪造 lastEvolveDate。
   if (task === 'safety' && active.combinedDaily
@@ -3367,7 +3473,8 @@ function getEvolveState() {
   const {
     autonomy: _autonomy, feedbackBatch: _batch, githubFeedbackBatch: _githubBatch,
     runtimeIssueBatch: _issues, agentSessionId: _agentSessionId,
-    candidateTaskRoot: _candidateTaskRoot, activeRun: _activeRun, ...publicFields
+    candidateTaskRoot: _candidateTaskRoot, activeRun: _activeRun,
+    activityEventFingerprints: _activityEventFingerprints, ...publicFields
   } = state;
   const { taskRoot: _taskRoot, ...publicActiveRun } = _activeRun || {};
   const collaboration = readTeamJournal(EVOLVE_LOG_DIR, state.activeRun) || state.collaboration;
@@ -3385,7 +3492,7 @@ function getEvolveState() {
     } : null,
     // 自主开启时不得再宣称「失败不自动重跑」（终检 #3）：固定文案按开关切换。
     automaticPolicy: state.autonomousEvolutionEnabled === true
-      ? '每天最多自动启动一轮综合巡检（北京时间 00:00-01:00）；自主进化开启期间，失败自动返工、验收通过后自动应用生效'
+      ? '每日综合巡检最多一轮（北京时间 00:00-01:00）；新活动和结束活动空闲后立即进化，同批去重；失败按既有退避返工，验收通过后自动应用'
       : publicFields.automaticPolicy,
     // 综合巡检的活动侧复核不写 lastEvolveDate（防封去重语义保留），单独暴露完成日供面板展示，
     // 否则活动进化卡片在每日合并轮后永远显示“未跑”。
