@@ -17,7 +17,25 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { test } = require('node:test');
+const { test, after } = require('node:test');
+const originalDataDir = process.env.FARM_DATA_DIR;
+const importTempRoot = fs.realpathSync(os.tmpdir());
+const importPrefix = path.join(importTempRoot, 'farm-journal-import-');
+assert.ok(importPrefix.startsWith(`${importTempRoot}${path.sep}`));
+const importDataDir = fs.mkdtempSync(importPrefix);
+process.env.FARM_DATA_DIR = importDataDir;
+const protectedSources = [__filename, require.resolve('../src/services/evolution-worktree')];
+const sourceFingerprint = () => protectedSources.map(file => [file,
+  crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), fs.lstatSync(file).mode & 0o777]);
+const originalSources = sourceFingerprint();
+after(() => {
+  try { assert.deepEqual(sourceFingerprint(), originalSources); }
+  finally {
+    fs.rmSync(importDataDir, { recursive: true, force: true });
+    if (originalDataDir === undefined) delete process.env.FARM_DATA_DIR;
+    else process.env.FARM_DATA_DIR = originalDataDir;
+  }
+});
 const { normalizePersistedState, reconcileLostCollaboration, buildCachedActivityContext } = require('../src/services/activity-evolver');
 const { inspectWorktree } = require('../src/services/evolution-worktree');
 

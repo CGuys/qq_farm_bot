@@ -14,6 +14,8 @@ const ORCHESTRATION_FILES = new Set([
   'core/scripts/run-evolution-team.js', 'core/src/services/evolution-team.js',
 ]);
 const PRIVATE_CONTROLS = new Set([
+  'core/src/services/evolution-main-workflow.js', 'core/src/services/evolution-main-mcp.js',
+  'core/scripts/run-evolution-main-mcp.js',
   '.gitignore', 'core/src/services/privacy-guard.js', 'core/src/services/local-privacy-terms.js',
   'core/src/services/private-config.js', 'core/src/services/feishu-notify.js', 'scripts/evolution-hooks/pre-push',
   'core/src/services/activity-evolver.js',
@@ -234,7 +236,12 @@ function readTeamJournal(logDir, active) {
     return {
       phase: value.phase,
       status: value.status,
+      ...(typeof value.mainSummary === 'string' && value.mainSummary
+        ? { mainSummary: safeReviewFeedback(value.mainSummary).slice(0, 6000) } : {}),
       activeAgent: AGENTS.has(value.activeAgent) ? value.activeAgent : '',
+      orchestrationMode: value.orchestrationMode === 'main_owned' ? 'main_owned' : '',
+      ...(value.orchestration === 'main-owned' ? { orchestration: 'main-owned' } : {}),
+      delegatedAgent: AGENTS.has(value.delegatedAgent) ? value.delegatedAgent : '',
       completedAt: Number(value.completedAt) || 0,
       head: String(value.head || ''),
       decision: ['approve', 'no_change'].includes(value.decision) ? value.decision : '',
@@ -382,6 +389,10 @@ function normalizeCheckpoint(value) {
     reviewFeedback: completed.some(item => item.phase === 'plan' && ['approve', 'no_change'].includes(item.decision))
       && !hasOutstandingReviewRejection(completed) ? '' : safeReviewFeedback(value.reviewFeedback),
     completed,
+    ...(value.mainWorkflow?.version === 1 ? { mainWorkflow: { version: 1,
+      workerInvocations: Math.min(12, Math.max(0, Math.floor(Number(value.mainWorkflow.workerInvocations) || 0))),
+      ...(value.mainWorkflow.blocked === 'unsafe_worktree' ? { blocked: 'unsafe_worktree' } : {}),
+    } } : {}),
   };
 }
 

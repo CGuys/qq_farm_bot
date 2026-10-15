@@ -1105,7 +1105,7 @@ function scheduleAppliedServiceConfirmation(commit, receipt) {
       }
       live.summary += '；应用回执闭环（新进程 pid/start/HEAD 与端口 API 已实测）';
       writeState(live);
-      await notify('农场 bot 进化已应用', [live.summary, live.changeSummary].filter(Boolean).join('\n'));
+      await notify('农场 bot 进化已应用', [live.summary, live.collaboration?.mainSummary, live.changeSummary].filter(Boolean).join('\n'), { finalApproved: true });
       scheduleAutonomyFromState(live);
       return;
     }
@@ -1429,10 +1429,18 @@ ${incrementalContext || buildIncrementalReviewContext({}, 'safety')}
   return cachedActivityContext ? `${base}\n\n${cachedActivityContext}` : base;
 }
 
-async function notify(title, content) {
+async function notify(title, content, options = {}) {
   const safeTitle = redactExternalText(title);
   const safeContent = redactExternalText(content);
   logger.info(`${safeTitle}：${safeContent}`);
+  // 子工具失败和中间恢复保留本机证据；双 Agent 仅由已验收的主 Agent 结果通知。
+  const state = readState();
+  if (state.dualAgentEnabled === true) {
+    if (options.finalApproved !== true || state.collaboration?.repairOnly
+      || !['no_change', 'pending_apply', 'applied'].includes(state.status)
+      || !isTeamResultApproved(state.collaboration, state.commit || gitHead())
+      || (state.status === 'pending_apply' && state.autonomousEvolutionEnabled === true)) return;
+  }
   // 直推默认飞书 webhook；store 配了非飞书的 webhook 则改走 pushoo
   try {
     const reminder = deps.store && typeof deps.store.getOfflineReminder === 'function'
@@ -2033,11 +2041,12 @@ function launchEvolution(task, payload = {}) {
     }
     settleDailyReview(next);
     writeState(next);
-    const notificationContent = [next.summary, next.changeSummary, ...next.privacyFindings].filter(Boolean).join('\n');
+    const notificationContent = [next.summary, next.collaboration?.mainSummary, next.changeSummary, ...next.privacyFindings].filter(Boolean).join('\n');
     await notify(
       evolutionNotificationTitle(task, outcome),
       task === 'safety' ? notificationContent
         : `${notificationContent}\n新活动: ${payload.newUnknown.join(',') || '无'}；结束: ${payload.newEnded.join(',') || '无'}；复核: ${payload.reviewIds.join(',') || '无'}`,
+      { finalApproved: settings.dualAgentEnabled && isTeamResultApproved(teamJournal, headAfter) },
     );
     if (outcome === 'push_failed') schedulePushRetry(headAfter, PUSH_RETRY_DELAY_MS);
     // 自主策略：pending_apply 自动应用；失败/验收未通过进入退避返工（含 repairOnly 续接）。
@@ -2336,6 +2345,27 @@ function retryReviewBlockedEvolution(opts = {}) {
   // 不新增游戏扫描/枚举，不带 automatic:true（不消费自动名额，也不重置已消费名额）。
   const report = readLatestReport();
   const reportUsable = !!report && report.status !== 'unavailable' && report?.online?.available !== false;
+  if (state.collaboration?.orchestration === 'main-owned') {
+    const checkpoint = normalizeCheckpoint(state.collaboration.checkpoint);
+    if (!checkpoint || checkpoint.baselineHead !== gitHead()
+      || checkpoint.taskIdentity.task !== state.lastTask) {
+      return { ok: false, reason: 'checkpoint_unverified', error: '主任务检查点与当前基线不匹配，已保留原任务待核对' };
+    }
+    const plan = getCapturedActivityPlan(state);
+    return (deps.launchEvolution || launchEvolution)(state.lastTask, {
+      manualReviewRetry: true,
+      autonomyResume: true,
+      resume: 'checkpoint',
+      automatic: checkpoint.taskIdentity.automatic,
+      combinedDaily: checkpoint.taskIdentity.combinedDaily,
+      preserveFeedbackBatch: true,
+      report: reportUsable ? report : null,
+      activityPlan: plan,
+      ...(state.lastTask === 'activity' ? {
+        newUnknown: plan?.newUnknown || [], newEnded: plan?.newEnded || [], reviewIds: plan?.reviewIds || [],
+      } : {}),
+    });
+  }
   const capturedActivityPlan = autonomous && state.lastTask === 'activity' ? getCapturedActivityPlan(state) : null;
   const activityPlan = capturedActivityPlan || (reportUsable ? planDailyActivityEvolution(report, state) : null);
   if (activityPlan && !capturedActivityPlan) {
@@ -2663,7 +2693,8 @@ function schedulePushRetry(commit, delayMs = PUSH_RETRY_DELAY_MS) {
     settleDailyReview(latest);
     writeState(latest);
     scheduleAutonomyFromState();
-    await notify('农场 bot 进化推送已恢复', [latest.summary, latest.changeSummary].filter(Boolean).join('\n'));
+    await notify('农场 bot 进化推送已恢复', [latest.summary, latest.changeSummary].filter(Boolean).join('\n'),
+      { finalApproved: isTeamResultApproved(latest.collaboration, commit) });
     // 重推收口后同样进入反馈回复链路（发布核对在发送前还会再做一次）。
     void githubFeedback.handlePublishedEvolution({
       status: 'pending_apply',
@@ -2932,7 +2963,9 @@ async function runAutonomyStep() {
 function autonomyDefer(state, key, message) {
   const autonomy = normalizeAutonomy(state.autonomy);
   const now = (deps.now || Date.now)();
-  const notifyNow = shouldNotify(autonomy, key, now);
+  const notifyNow = state.dualAgentEnabled !== true && shouldNotify(autonomy, key, now);
+  autonomy.lastReworkKey = key; // 诊断原因独立于通知发送记录。
+  logger.info(redactExternalText(message));
   if (key.startsWith('apply-')) {
     const applyKey = autonomyTargetKey(state, 'apply');
     autonomy.applyAttempts = autonomy.lastApplyKey === applyKey ? autonomy.applyAttempts + 1 : 1;
@@ -2942,7 +2975,6 @@ function autonomyDefer(state, key, message) {
     const target = autonomyTargetKey(state, 'rework');
     autonomy.reworkAttempts = autonomy.deferredTarget === target ? autonomy.reworkAttempts + 1 : 1;
     autonomy.deferredTarget = target;
-    autonomy.lastReworkKey = key; // 仅诊断留痕；调度比对一律走 deferredTarget
     autonomy.lastReworkAt = now;
     // 同一任务连续无进展 → 之后的真实返工强制走 diagnose（不复用旧意见空转）。
     autonomy.preferDiagnosis = autonomy.preferDiagnosis
@@ -3151,8 +3183,8 @@ async function finalizeRecoveredEvolution(activeRun, signal = 'parent_restart') 
   settleDailyReview(next);
   writeState(next);
   running = false;
-  await notify(`农场 bot ${tag}恢复结果`, [next.summary, next.changeSummary, ...next.privacyFindings]
-    .filter(Boolean).join('\n'));
+  await notify(`农场 bot ${tag}恢复结果`, [next.summary, next.collaboration?.mainSummary, next.changeSummary, ...next.privacyFindings]
+    .filter(Boolean).join('\n'), { finalApproved: teamApproved });
   if (next.status === 'push_failed') schedulePushRetry(headAfter, PUSH_RETRY_DELAY_MS);
   scheduleAutonomyFromState();
   if (next.status === 'pending_apply' && !teamJournal?.repairOnly) {

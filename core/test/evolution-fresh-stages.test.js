@@ -2,15 +2,23 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { test, after } = require('node:test');
 const priorDataDir = process.env.FARM_DATA_DIR;
 const importDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'farm-fresh-import-'));
 process.env.FARM_DATA_DIR = importDataDir;
+const protectedSources = [__filename, require.resolve('../src/services/evolution-sessions'), require.resolve('../src/services/evolution-learning')];
+const sourceFingerprint = () => protectedSources.map(file => [file,
+  crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), fs.lstatSync(file).mode & 0o777]);
+const originalSources = sourceFingerprint();
 after(() => {
-  if (priorDataDir === undefined) delete process.env.FARM_DATA_DIR;
-  else process.env.FARM_DATA_DIR = priorDataDir;
-  fs.rmSync(importDataDir, { recursive: true, force: true });
+  try { assert.deepEqual(sourceFingerprint(), originalSources); }
+  finally {
+    if (priorDataDir === undefined) delete process.env.FARM_DATA_DIR;
+    else process.env.FARM_DATA_DIR = priorDataDir;
+    fs.rmSync(importDataDir, { recursive: true, force: true });
+  }
 });
 
 // 全新会话政策（owner 2026-10-09）聚焦行为测试：
@@ -21,9 +29,9 @@ after(() => {
 //    invalid_decision 拒绝（身份检查未放宽）。
 // 3) 私有技能材料化：仅已批准经验生成、固定主题名、0700/0600、篡改重生成、
 //    失焦回收、空权威零脚手架、敏感条目不落盘、符号链接拒绝、上下文注入。
-// 4) 真实 runner 端到端（严格假 CLI，只支持 fresh 参数）：污染的 legacy 会话
-//    登记与"失败 compact"不再影响任何阶段；同 provider 主/子 Agent；带
-//    initialFailure 的轮内恢复同样全部 fresh；断言真实 argv 无任何 resume。
+// 4) 真实 runner 端到端（严格假 CLI + 真 stdio MCP）：每轮一个 fresh Main，
+//    Sub 是该 Main 的工具；污染 legacy 登记不影响工作。两 provider 反选和同
+//    provider 均检查原生调用无 resume/app-server、Main 持续接回并修正。
 
 const sessions = require('../src/services/evolution-sessions');
 const learning = require('../src/services/evolution-learning');
@@ -141,6 +149,11 @@ test('journal 读取侧丢弃空 completed 的 in_run 凭据；runner 身份检�
       fs.writeFileSync(path.join(dir, file), text);
     };
     write('core/scripts/run-evolution-team.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-team.js')));
+    write('core/scripts/run-evolution-main-mcp.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-main-mcp.js')));
+    write('core/scripts/evolution-apply-process.js', `module.exports = require(${JSON.stringify(require.resolve('../scripts/evolution-apply-process'))});`);
+    for (const name of ['evolution-main-workflow', 'evolution-main-mcp']) {
+      write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
+    }
     for (const name of ['activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-validation', 'evolution-countercheck', 'evolution-sessions', 'evolution-worktree']) {
       write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
     }
@@ -255,123 +268,50 @@ test('材料化：仅已批准主题、固定命名、0700/0600、篡改重生�
 
 // ---- 4) 真实 runner 端到端：fresh CLI、污染 registry、同 provider、轮内恢复 ----
 
-test('真实 runner：污染 legacy registry 不影响阶段执行，全部阶段 fresh argv，同 provider 主/子可用', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'farm-fresh-runner-'));
-  const write = (file, text) => {
-    const full = path.resolve(dir, file);
-    if (full !== dir && !full.startsWith(dir + path.sep)) throw new Error('fixture_escape');
-    fs.mkdirSync(path.dirname(full), { recursive: true });
-    fs.writeFileSync(full, text);
-  };
-  const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-  try {
-    write('core/scripts/run-evolution-team.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-team.js')));
-    for (const name of ['activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-validation', 'evolution-countercheck', 'evolution-sessions', 'evolution-worktree']) {
-      write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
-    }
-    write('core/src/services/evolution-references.js', 'module.exports.collectPublicReferences = async () => ({state:"complete", discoveryComplete:true});\n');
-    write('.gitignore', 'core/data/\n');
-    write('docs/HANDOFF.md', '# 当前执行策略\nfresh CLI\n\n# 用户硬约束\n不碰核心收益链\n');
-    write('core/src/example.js', 'module.exports = 1;\n');
-    write('core/test/example.test.js', 'require("node:assert/strict").ok([1, 2].includes(require("../src/example")));\n');
-    // 严格假 CLI：只支持 fresh 参数（--json-schema/--output-schema），不支持 /compact
-    // 与 app-server；把每次真实 argv + 是否收到全新会话摘录记入调用日志。
-    const fakeCli = `#!/usr/bin/env node
-const fs = require('node:fs');
-let prompt = '';
-process.stdin.on('data', c => { prompt += c; });
-process.stdin.on('end', () => {
-  if (prompt === '/compact' || process.argv.includes('app-server')) {
-    fs.appendFileSync('core/data/cli-invocations.jsonl', JSON.stringify({ rejected: process.argv.slice(0, 4) }) + '\\n');
-    process.exit(9);
+test('真实 runner：污染 legacy registry 不影响单 Main 及内嵌工具；两 provider 反选与同 provider 均 fresh', t => {
+  const { NATIVE_CLI, createRunnerFixture } = require('./evolution-main-runner.test');
+  const f = createRunnerFixture(t);
+  const cli = NATIVE_CLI.replace("const main=!!config.farm_evolution", String.raw`const learnedLine=input.split('\n').find(line=>line.startsWith('- 协作流程与阶段契约'));
+const learnedRuleRead=!!learnedLine&&fs.readFileSync(learnedLine.slice(learnedLine.indexOf('：')+1),'utf8').includes('验证后才应用');
+write('core/data/prompt-'+process.pid+'.json',JSON.stringify({learnedRuleRead,input,contextCopies:input.split('以下是协调进程从 docs/HANDOFF.md 确定性摘出的有界当前上下文').length-1}));
+const main=!!config.farm_evolution`);
+  for (const agent of ['codex', 'claude']) {
+    f.write(`core/data/fake-${agent}`, cli); fs.chmodSync(f.target(`core/data/fake-${agent}`), 0o700);
   }
-  const phase = prompt.match(/只完成 (\\w+) 阶段/)[1];
-  fs.appendFileSync('core/data/cli-invocations.jsonl', JSON.stringify({
-    argv: process.argv.slice(2),
-    freshContext: /全新会话/.test(prompt),
-    boundedExcerpt: /有界当前上下文/.test(prompt) || /不存在或不可读/.test(prompt),
-    phase,
-    learnedRuleRead: (() => {
-      const line = prompt.split('\\n').find(value => value.startsWith('- 协作流程与阶段契约'));
-      if (!line) return false;
-      const file = line.slice(line.indexOf('：') + 1);
-      return fs.readFileSync(file, 'utf8').includes('验证后才应用');
-    })(),
-    autoCompactDisabled: process.env.DISABLE_AUTO_COMPACT === '1',
-    contextCopies: prompt.split('以下是协调进程从 docs/HANDOFF.md 确定性摘出的有界当前上下文').length - 1,
-  }) + '\\n');
-  if (phase === 'implement') {
-    fs.writeFileSync('core/src/example.js', 'module.exports = 2;\\n');
-    fs.appendFileSync('docs/HANDOFF.md', 'Verified fresh run\\n');
-  }
-  const decision = { research: 'researched', plan: 'approve', implement: 'implemented', review: 'approve', diagnose: 'repair', repair: 'no_change', repair_review: 'approve' }[phase];
-  const result = {decision, summary: 'fresh fixture', ...(phase === 'diagnose' ? {allowedFiles: []} : {}), ...(phase === 'plan' ? {allowedFiles:['core/src/example.js','docs/HANDOFF.md','core/test/behavior.test.js'], acceptanceChecks:['example ok'], baselineChecks:[]} : {})};
-  const schemaIndex = process.argv.indexOf('--json-schema');
-  if (schemaIndex < 0 || !JSON.parse(process.argv[schemaIndex + 1]).properties.decision.enum.includes(decision)) throw new Error('Missing fresh stage schema');
-  process.stdout.write(JSON.stringify({subtype:'success', is_error:false, session_id: 'fresh-fake-' + phase + '-' + process.pid, result:'completed', structured_output:result}));
-});
-`;
-    write('core/data/fake-agent', fakeCli);
-    fs.chmodSync(path.join(dir, 'core/data/fake-agent'), 0o700);
-    fs.mkdirSync(path.join(dir, 'core/data/logs'), { recursive: true });
-    // 污染 legacy 会话登记：损坏 JSON + 伪装角色锁目录。fresh 路径绝不读写它们。
-    fs.mkdirSync(path.join(dir, 'core/data/evolution-sessions/main'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'core/data/evolution-sessions/registry.json'), '{corrupt');
-    git(['init', '-q']);
-    git(['config', 'user.name', 'Test']);
-    git(['config', 'user.email', ['test', 'users.noreply.github.com'].join('@')]);
-    fs.appendFileSync(path.join(dir, '.git/info/exclude'), 'docs/HANDOFF.md\n');
-    git(['add', '.']);
-    git(['commit', '-qm', 'fixture']);
-    const baseCommit = git(['rev-parse', 'HEAD']);
-    learning.recordApprovedLessons({dataDir: path.join(dir, 'core/data'), mainAgent: 'claude', writerAgent: 'claude',
-      commit: baseCommit, lessons: [{topic: 'workflow', rule: '验证后才应用', evidence: 'regression'}]});
-    const learnedContext = learning.buildLearningContext(path.join(dir, 'core/data'));
-
-    const run = (runId, extra = {}) => {
-      const input = {
-        runId, baseCommit, task: 'safety', prompt: `【待协调进程注入当前 HANDOFF 有界摘录】\nFixture task\n${learnedContext}`,
-        settings: { mainAgent: 'claude', subAgent: 'claude', dualAgentEnabled: true },
-        bins: { claude: path.join(dir, 'core/data/fake-agent') },
-        logDir: path.join(dir, 'core/data/logs'), dataDir: path.join(dir, 'core/data'),
-        ...extra,
-      };
-      return spawnSync(process.execPath, ['core/scripts/run-evolution-team.js'], {
-        cwd: dir, input: JSON.stringify(input), encoding: 'utf8', timeout: 120000,
-        env: { ...process.env, FARM_DATA_DIR: path.join(dir, 'core/data') },
-      });
-    };
-    const invocations = () => fs.readFileSync(path.join(dir, 'core/data/cli-invocations.jsonl'), 'utf8')
-      .trim().split('\n').map(line => JSON.parse(line));
-
-    // 主流程：同 provider（claude 主/子）+ 轮内恢复（initialFailure → diagnose 起步）。
-    const result = run('fresh-e2e', { initialFailure: { code: 'cli_exit', phase: 'research', agent: 'claude' } });
-    assert.equal(result.status, 0, result.stderr);
-    const journal = JSON.parse(fs.readFileSync(path.join(dir, 'core/data/logs', 'evolve-team-fresh-e2e.json'), 'utf8'));
-    assert.equal(journal.status, 'completed');
-    assert.equal(journal.decision, 'approve');
-    assert.notEqual(journal.head, baseCommit);
-    const calls = invocations();
-    assert.ok(calls.length >= 5, '至少 diagnose/repair/repair_review/research/review 等多个阶段');
-    assert.ok(calls.every(call => !call.rejected), '没有任何 /compact 或 app-server 调用');
+  f.write('core/data/evolution-sessions/registry.json', '{corrupt');
+  fs.mkdirSync(f.target('core/data/evolution-sessions/main'), { recursive: true });
+  learning.recordApprovedLessons({ dataDir: f.target('core/data'), mainAgent: 'claude', writerAgent: 'claude',
+    commit: f.baseCommit, lessons: [{ topic: 'workflow', rule: '验证后才应用', evidence: 'regression' }] });
+  const learnedContext = learning.buildLearningContext(f.target('core/data'));
+  for (const settings of [{ mainAgent: 'codex', subAgent: 'claude', dualAgentEnabled: true },
+    { mainAgent: 'claude', subAgent: 'codex', dualAgentEnabled: true },
+    { mainAgent: 'claude', subAgent: 'claude', dualAgentEnabled: true }]) {
+    f.git(['reset', '--hard', f.baseCommit]); f.write('core/data/native-calls.jsonl', '');
+    const result = f.run(settings, { runId: `fresh-${settings.mainAgent}-${settings.subAgent}`,
+      prompt: `【待协调进程注入当前 HANDOFF 有界摘录】\nFixture task\n${learnedContext}`,
+      initialFailure: { code: 'cli_exit', phase: 'research', agent: settings.subAgent } });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const calls = fs.readFileSync(f.target('core/data/native-calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(calls.length, 2, '这一轮只启动一个新 Main，再由同一 Main 调用一个内嵌 Sub');
+    const main = calls.find(call => call.kind === 'main'); const worker = calls.find(call => call.kind === 'worker');
+    assert.equal(main.provider, settings.mainAgent); assert.equal(worker.provider, settings.subAgent);
     for (const call of calls) {
-      assert.ok(!call.argv.includes('--resume') && !call.argv.includes('resume')
-        && !call.argv.some(arg => arg.startsWith('--resume')), `fresh argv: ${JSON.stringify(call.argv)}`);
-      assert.deepEqual(call.argv.slice(0, 4), ['-p', '--dangerously-skip-permissions', '--output-format', 'json']);
-      assert.ok(call.learnedRuleRead, '真实新会话从注入路径读取验收规则');
-      assert.ok(call.autoCompactDisabled);
-      assert.equal(call.contextCopies, 1, '每阶段只注入一份交接摘录');
-      assert.ok(call.freshContext, '阶段提示含全新会话声明');
-      assert.ok(call.boundedExcerpt, '阶段提示含有界摘录（或缺失告示）');
+      assert.ok(!call.argv.some(arg => arg === 'resume' || arg === '--resume' || arg.startsWith('--resume=')), '不续接历史 native 会话');
+      assert.ok(!call.argv.includes('app-server'));
     }
-    // 轮内恢复真实走过 diagnose；同 provider 下主/子阶段都由 claude 形参执行。
-    const phases = calls.map(call => call.phase);
-    assert.ok(phases.includes('diagnose'), `轮内恢复从 diagnose 起步: ${phases.join(',')}`);
-    assert.ok(['diagnose', 'repair', 'research', 'plan', 'implement', 'review'].every(p => phases.includes(p)), `全部阶段真实执行: ${phases.join(',')}`);
-    // 提交只含公开源码（HANDOFF 私有不入库）；污染 registry 原样保留（未被读取/修复）。
-    const committed = git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean);
+    const context = JSON.parse(fs.readFileSync(f.target(`core/data/prompt-${main.pid}.json`)));
+    assert.equal(context.learnedRuleRead, true, '当前 Main 实际读取注入的已批准经验规则');
+    assert.equal(context.contextCopies, 1, '持续主会话只注入一份有界 HANDOFF');
+    assert.match(context.input, /持续主 Agent|全新会话/); assert.match(context.input, /有界当前上下文/);
+    assert.ok(worker.promptLength <= 6000, 'Sub 只收到这一项任务的有界指令');
+    const continued = JSON.parse(fs.readFileSync(f.target('core/data/main-continued.json')));
+    assert.equal(continued.pid, main.pid, '工具失败仍回到同一 Main，由 Main 直接修正');
+    assert.equal(continued.workerFailed, true);
+    const journal = JSON.parse(fs.readFileSync(f.target(`core/data/logs/evolve-team-fresh-${settings.mainAgent}-${settings.subAgent}.json`)));
+    assert.equal(journal.status, 'completed'); assert.equal(journal.orchestration, 'main-owned');
+    const committed = f.git(['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean);
     assert.deepEqual(committed, ['core/src/example.js']);
-    assert.match(fs.readFileSync(path.join(dir, 'core/data/evolution-sessions/registry.json'), 'utf8'), /corrupt/);
-    assert.ok(fs.existsSync(path.join(dir, 'core/data/evolution-sessions/main')), '伪装角色锁目录未被触碰');
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    assert.equal(fs.readFileSync(f.target('core/data/evolution-sessions/registry.json'), 'utf8'), '{corrupt');
+    assert.ok(fs.existsSync(f.target('core/data/evolution-sessions/main')));
+  }
 });

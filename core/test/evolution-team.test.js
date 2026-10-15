@@ -35,6 +35,48 @@ const {
 const { normalizePersistedState, normalizeActiveRun } = require('../src/services/activity-evolver');
 const { requireEvolutionConfigAdmin } = require('../src/controllers/admin-activity-update-routes');
 
+// Reuse the real JSONRPC stdio fixture while keeping the older regression
+// scenarios (isolated builds/counterchecks, exact resume and native-ID absence).
+function mainOwnedFixtureCli() {
+  const { NATIVE_CLI } = require('./evolution-main-runner.test');
+  let script = NATIVE_CLI.replace("provider=path.basename(process.argv[1]).includes('claude')?'claude':'codex'", "provider=argv.includes('exec')?'codex':'claude'");
+  script = script.replace("const input=fs.readFileSync(0,'utf8');", String.raw`if(argv.includes('resume')||argv.some(arg=>arg==='--resume'||arg.startsWith('--resume='))||argv.includes('app-server'))process.exit(9);
+const input=fs.readFileSync(0,'utf8');if(input==='/compact')process.exit(9);`);
+  script = script.replace('const emit=value=>', String.raw`append('core/data/calls.log',(main?'main':'worker')+':'+provider+'\n');
+if(provider==='codex'){
+ if(fs.existsSync('core/data/giant-events'))process.stdout.write('x'.repeat(2500000)+'\n');
+ if(!fs.existsSync('core/data/no-thread-events'))process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'fixture-native-'+process.pid})+'\n');
+ if(fs.existsSync('core/data/drift'))process.stdout.write(JSON.stringify({type:'thread.started',thread_id:'different-output-id'})+'\n');
+}
+const emit=value=>`);
+  const begin = script.indexOf("  const plan=await tool('approve_plan'");
+  const end = script.indexOf("  emit({decision:JSON.parse(accepted.content[0].text).decision,summary:'Main completed the one continuous session'});", begin)
+    + "  emit({decision:JSON.parse(accepted.content[0].text).decision,summary:'Main completed the one continuous session'});".length;
+  assert.ok(begin > 0 && end > begin, 'the strict MCP client has the expected Main task boundary');
+  script = script.slice(0, begin) + String.raw`  const existing=JSON.parse((await tool('status')).content[0].text);
+  if(!existing.allowedFiles.length){
+   const plan=await tool('approve_plan',{summary:'One caller and its regression',allowedFiles:['core/src/example.js','docs/HANDOFF.md','web/src/example.js','core/test/behavior.test.js'],acceptanceChecks:['example returns expected value'],baselineChecks:fs.existsSync('core/data/countercheck-required')?[{sourceFiles:['core/src/example.js'],testFiles:['core/test/behavior.test.js'],minFailures:1}]:[]});if(plan.isError)throw Error(plan.content[0].text);
+  }
+  if(!existing.changedFiles.length){
+   const worker=await tool('delegate_worker',{instruction:'Implement this one caller, retain partial changes on failure',allowedFiles:['core/src/example.js','docs/HANDOFF.md']});
+   if(!worker.isError)throw Error('Fixture expected a worker exit failure');
+   write('core/data/main-continued.json',JSON.stringify({pid:process.pid,workerFailed:true}));
+   write('core/src/example.js','module.exports = 2;\n');append('docs/HANDOFF.md','Main repaired and inspected actual candidate\n');
+  }
+  if(fs.existsSync('core/data/touch-web'))write('web/src/example.js','export default 2;\n');
+  if(fs.existsSync('core/data/countercheck-required'))write('core/test/behavior.test.js','require("node:test")("detect old behavior", () => require("node:assert/strict").equal(require("../src/example"), 2));\n');
+  const verified=await tool('verify_candidate');if(verified.isError)throw Error(verified.content[0].text);
+  if(fs.existsSync('core/data/countercheck-required')){
+   const proof=JSON.parse(fs.readFileSync('core/data/evolution-countercheck.json'));
+   if(proof.state!=='passed'||proof.checks[0].baseline.behaviorFailures!==1||proof.checks[0].current.failed!==0)throw Error('Coordinator evidence missing');
+  }
+  if(fs.existsSync('core/data/reject-review'))throw Error('Synthetic Main withheld acceptance');
+  const accepted=await tool('accept_result',{decision:'approve',summary:'Main verified and accepted actual behavior',lessons:[],feedbackReviewed:false,githubResolutions:[]});if(accepted.isError)throw Error(accepted.content[0].text);
+  emit({decision:JSON.parse(accepted.content[0].text).decision,summary:'Main completed the one continuous session'});` + script.slice(end);
+  return script;
+}
+
+
 test('主子 Agent 配置写入同时要求有效会话与管理员角色', () => {
   for (const role of ['user', undefined, 'admin', 'super_admin']) {
     let continued = false;
@@ -557,7 +599,7 @@ test('配置 API 的服务方法持久化角色，旧入口兼容且执行中不
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('隔离 Git 仓库跑真实协调进程：CLI 交接、独立测试、复核、提交与拒绝收口', () => {
+test('隔离 Git 仓库跑真实协调进程：单 Main 工具回执、独立验证、验收后提交与拒绝收口', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'farm-team-runner-'));
   const write = (file, text) => {
     fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
@@ -566,6 +608,11 @@ test('隔离 Git 仓库跑真实协调进程：CLI 交接、独立测试、复�
   const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   try {
     write('core/scripts/run-evolution-team.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-team.js')));
+    write('core/scripts/run-evolution-main-mcp.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-main-mcp.js')));
+    write('core/scripts/evolution-apply-process.js', `module.exports = require(${JSON.stringify(require.resolve('../scripts/evolution-apply-process'))});`);
+    for (const name of ['evolution-main-workflow', 'evolution-main-mcp']) {
+      write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
+    }
     for (const name of ['activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-validation', 'evolution-countercheck', 'evolution-sessions', 'evolution-worktree']) {
       write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
     }
@@ -589,124 +636,7 @@ test('隔离 Git 仓库跑真实协调进程：CLI 交接、独立测试、复�
     fs.chmodSync(path.join(dir, 'web/node_modules/.bin/vue-tsc'), 0o700);
     fs.chmodSync(path.join(dir, 'web/node_modules/.bin/vite'), 0o700);
     write('web/dist/index.html', 'approved UI');
-    const fakeCli = `#!/usr/bin/env node
-const fs = require('node:fs');
-// 原生会话感知夹具 CLI：codex app-server 子协议（thread/read→resume→compact/start
-// + item/started/completed contextCompaction）、claude 原生 /compact（compact_boundary
-// + 成功 result）、首轮 session_id/thread.started 捕获与 resume 参数接受。
-const SESSION = { claude: 'aaaa1111-2222-3333-4444-555566667777', codex: 'bbbb8888-9999-aaaa-bbbb-ccccddddeeee' };
-if (process.argv[2] === 'app-server') {
-  let buffer = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => {
-    buffer += chunk;
-    let index;
-    while ((index = buffer.indexOf('\\n')) >= 0) {
-      const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      let value; try { value = JSON.parse(line); } catch { continue; }
-      if (value.id === undefined || !value.method) continue;
-      const reply = result => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: value.id, result }) + '\\n');
-      if (value.method === 'thread/read' || value.method === 'thread/resume') {
-        fs.appendFileSync('core/data/appserver.log', value.method + '\\n');
-        reply({ thread: { id: value.params.threadId } });
-      } else if (value.method === 'thread/compact/start') {
-        fs.appendFileSync('core/data/appserver.log', 'thread/compact/start\\n');
-        reply({});
-        for (const method of ['item/started', 'item/completed']) {
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params: { threadId: value.params.threadId, item: { type: 'contextCompaction' } } }) + '\\n');
-        }
-      } else reply({});
-    }
-  });
-  return;
-}
-let prompt = '';
-process.stdin.on('data', c => { prompt += c; });
-process.stdin.on('end', () => {
-  const agent = process.argv.includes('exec') ? 'codex' : 'claude';
-  // 实测参数合同：该 codex 二进制的 exec resume 子命令不支持 --color（仅 exec 有）；
-  // claude print/stream-json 模式必须带 --verbose 才输出事件流。
-  if (agent === 'codex' && process.argv.includes('resume') && process.argv.includes('--color')) process.exit(2);
-  if (prompt === '/compact') {
-    if (!process.argv.includes('--verbose')) process.exit(2);
-    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'compact_boundary', session_id: SESSION.claude }) + '\\n');
-    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: SESSION.claude }) + '\\n');
-    return;
-  }
-  const phase = prompt.match(/只完成 (\\w+) 阶段/)[1];
-  fs.appendFileSync('core/data/calls.log', phase + ':' + agent + '\\n');
-  if (phase === 'implement') {
-    fs.writeFileSync('core/src/example.js', 'module.exports = 2;\\n');
-    fs.appendFileSync('docs/HANDOFF.md', 'Verified implementation\\n');
-    if (fs.existsSync('core/data/touch-web')) fs.writeFileSync('web/src/example.js', 'export default 2;\\n');
-    if (fs.existsSync('core/data/countercheck-required')) fs.writeFileSync('core/test/behavior.test.js', 'require("node:test")("detect old behavior", () => require("node:assert/strict").equal(require("../src/example"), 2));\\n');
-  }
-  if (phase === 'review' && fs.existsSync('core/data/countercheck-required')) {
-    const proof = JSON.parse(fs.readFileSync('core/data/evolution-countercheck.json'));
-    if (proof.state !== 'passed' || proof.checks[0].baseline.behaviorFailures !== 1 || proof.checks[0].current.failed !== 0) throw new Error('Coordinator evidence missing');
-  }
-  const reject = fs.existsSync('core/data/reject-review');
-  const decision = { triage: 'triaged', research: 'researched', plan: 'approve', implement: 'implemented', review: reject ? 'reject' : 'approve', diagnose: reject ? 'stop' : 'repair', repair: 'no_change', repair_review: 'approve' }[phase];
-  const result = {decision, summary: 'Verified fixture change', ...(phase === 'diagnose' ? {allowedFiles: []} : {}), ...(phase === 'plan' ? {allowedFiles:['core/src/example.js','docs/HANDOFF.md','web/src/example.js','core/test/behavior.test.js'], acceptanceChecks:['example returns expected value'], baselineChecks:fs.existsSync('core/data/countercheck-required')?[{sourceFiles:['core/src/example.js'],testFiles:['core/test/behavior.test.js'],minFailures:1}]:[]} : {}), ...(['plan','review'].includes(phase) ? {feedbackReviewed: true, lessons: []} : {}), ...(phase === 'review' ? {githubResolutions: []} : {})};
-  // 读取实际传入的 Schema（claude 内联 / codex 文件），对交接结果做递归结构校验，
-  // 不只看 decision 枚举：缺必填字段、多字段、类型/枚举/模式不匹配都在 CLI 侧暴露，
-  // 让契约回归（如可选字段重新出现）在此直接失败而不是流入协调进程。
-  const validate = (value, schema, where) => {
-    if (Array.isArray(schema.anyOf)) {
-      if (!schema.anyOf.some(branch => { try { validate(value, branch, where); return true; } catch { return false; } })) throw new Error('schema anyOf failed at ' + where);
-      return;
-    }
-    if (schema.properties) {
-      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('schema expected object at ' + where);
-      for (const key of schema.required || []) if (!(key in value)) throw new Error('schema missing required ' + where + '.' + key);
-      for (const key of Object.keys(value)) {
-        if (!schema.properties[key]) throw new Error('schema unexpected ' + where + '.' + key);
-        validate(value[key], schema.properties[key], where + '.' + key);
-      }
-      return;
-    }
-    const fail = (detail) => { throw new Error('schema ' + detail + ' at ' + where); };
-    if (schema.type === 'array') {
-      if (!Array.isArray(value)) fail('expected array');
-      if (schema.maxItems && value.length > schema.maxItems) fail('maxItems');
-      value.forEach((item, index) => validate(item, schema.items, where + '[' + index + ']'));
-      return;
-    }
-    if (schema.type === 'string') {
-      if (typeof value !== 'string') fail('expected string');
-      if (schema.enum && !schema.enum.includes(value)) fail('enum');
-      if (schema.pattern && !new RegExp(schema.pattern).test(value)) fail('pattern');
-      if (schema.maxLength && value.length > schema.maxLength) fail('maxLength');
-      return;
-    }
-    if (schema.type === 'integer') {
-      if (!Number.isInteger(value) || value < schema.minimum || value > schema.maximum) fail('integer range');
-      return;
-    }
-    if (schema.type === 'boolean') { if (typeof value !== 'boolean') fail('expected boolean'); return; }
-    if (schema.type === 'null') { if (value !== null) fail('expected null'); return; }
-    fail('unsupported type ' + schema.type);
-  };
-  const schemaFlag = agent === 'claude' ? '--json-schema' : '--output-schema';
-  const schemaIndex = process.argv.indexOf(schemaFlag);
-  if (schemaIndex < 0) throw new Error('Missing stage schema');
-  const schema = agent === 'claude' ? JSON.parse(process.argv[schemaIndex + 1]) : JSON.parse(fs.readFileSync(process.argv[schemaIndex + 1]));
-  if (!schema.properties.decision.enum.includes(decision)) throw new Error('Stage decision outside schema enum');
-  validate(result, schema, phase);
-  if (agent === 'claude') {
-    if (phase === 'research' && fs.existsSync('core/data/invalid-research-once')) {
-      fs.unlinkSync('core/data/invalid-research-once');
-      process.stdout.write(JSON.stringify({subtype:'success', is_error:false, session_id: SESSION.claude, result:'unstructured report'}));
-    } else process.stdout.write(JSON.stringify({subtype:'success', is_error:false, session_id: SESSION.claude, result:'completed', structured_output:result}));
-  } else {
-    if (process.argv.includes('--json')) {
-      process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SESSION.codex }) + '\\n');
-    }
-    fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], JSON.stringify(result));
-  }
-});
-`;
+    const fakeCli = mainOwnedFixtureCli();
     write('core/data/fake-agent', fakeCli);
     fs.chmodSync(path.join(dir, 'core/data/fake-agent'), 0o700);
     fs.mkdirSync(path.join(dir, 'core/data/logs'), { recursive: true });
@@ -736,7 +666,7 @@ process.stdin.on('end', () => {
     const active = { runId: 'success', baseCommit, agent: 'codex', subAgent: 'claude', dualAgentEnabled: true };
     assert.equal(isTeamResultApproved(readTeamJournal(path.join(dir, 'core/data/logs'), active), head), true);
     assert.match(success.stdout, /# pass 1/);
-    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'research:claude\nplan:codex\nimplement:claude\nreview:codex\n');
+    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'main:codex\nworker:claude\n');
     // 此 reset 只操作测试创建的临时仓库。
     git(['reset', '--hard', baseCommit]);
     write('core/data/reject-review', '1');
@@ -754,9 +684,9 @@ process.stdin.on('end', () => {
     const recoveredHead = git(['rev-parse', 'HEAD']);
     const journal = readTeamJournal(path.join(dir, 'core/data/logs'), { ...active, runId: 'recovered' });
     assert.equal(journal.recoveryAttempt, 1);
-    assert.equal(journal.lastFailure.code, 'invalid_output');
+    assert.equal(journal.lastFailure.code, 'cli_exit');
     assert.equal(isTeamResultApproved(journal, recoveredHead), true);
-    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'research:claude\ndiagnose:codex\nrepair:claude\nresearch:claude\nplan:codex\nimplement:claude\nreview:codex\n');
+    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'main:codex\nworker:claude\n');
     assert.ok(fs.readdirSync(path.join(dir, 'core/data/logs')).every(file => !file.endsWith('-schema.json')));
     git(['reset', '--hard', baseCommit]);
     write('core/data/touch-web', '1');
@@ -778,14 +708,14 @@ process.stdin.on('end', () => {
     fs.unlinkSync(path.join(dir, 'core/data/countercheck-required'));
     fs.unlinkSync(path.join(dir, 'core/data/touch-web'));
     write('core/data/calls.log', '');
-    // 角色反选：主 Agent 走 claude（内联 --json-schema），子 Agent 走 codex
-    // （--output-schema 文件）——两种 Schema 传递机制都要通过同一递归结构校验。
+    // 角色反选：持续 Main 走 claude（内联 schema），工具走 codex（schema 文件）；
+    // 保留设置选择与真实 MCP 回执链，绝不写死 provider。
     const swapped = run('swapped', { mainAgent: 'claude', subAgent: 'codex' });
     assert.equal(swapped.status, 0, swapped.stderr);
     const swappedHead = git(['rev-parse', 'HEAD']);
     assert.notEqual(swappedHead, baseCommit);
     assert.equal(git(['status', '--porcelain']), '');
-    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'research:codex\nplan:claude\nimplement:codex\nreview:claude\n');
+    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'main:claude\nworker:codex\n');
     assert.equal(isTeamResultApproved(readTeamJournal(path.join(dir, 'core/data/logs'), { runId: 'swapped', baseCommit, agent: 'claude', subAgent: 'codex', dualAgentEnabled: true }), swappedHead), true);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -807,70 +737,19 @@ test('真实 runner 跨进程：run1 真实 checkpoint，run2 按精确合同续
     fs.writeFileSync(full, data);
   };
   const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-  const fakeCli = `#!/usr/bin/env node
-const fs = require('node:fs');
-const SESSION = { claude: 'aaaa1111-2222-3333-4444-555566667777', codex: 'bbbb8888-9999-aaaa-bbbb-ccccddddeeee' };
-if (process.argv[2] === 'app-server') {
-  let buffer = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => {
-    buffer += chunk;
-    let index;
-    while ((index = buffer.indexOf('\\n')) >= 0) {
-      const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      let value; try { value = JSON.parse(line); } catch { continue; }
-      if (value.id === undefined || !value.method) continue;
-      const reply = result => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: value.id, result }) + '\\n');
-      if (value.method === 'thread/read' || value.method === 'thread/resume') reply({ thread: { id: value.params.threadId } });
-      else if (value.method === 'thread/compact/start') {
-        reply({});
-        for (const method of ['item/started', 'item/completed']) {
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params: { threadId: value.params.threadId, item: { type: 'contextCompaction' } } }) + '\\n');
-        }
-      } else reply({});
-    }
-  });
-  return;
-}
-let prompt = '';
-process.stdin.on('data', c => { prompt += c; });
-process.stdin.on('end', () => {
-  const agent = process.argv.includes('exec') ? 'codex' : 'claude';
-  // 实测参数合同：该 codex 二进制的 exec resume 子命令不支持 --color（仅 exec 有）；
-  // claude print/stream-json 模式必须带 --verbose 才输出事件流。
-  if (agent === 'codex' && process.argv.includes('resume') && process.argv.includes('--color')) process.exit(2);
-  if (prompt === '/compact') {
-    if (!process.argv.includes('--verbose')) process.exit(2);
-    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'compact_boundary', session_id: SESSION.claude }) + '\\n');
-    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: SESSION.claude }) + '\\n');
-    return;
-  }
-  const phase = prompt.match(/只完成 (\\w+) 阶段/)[1];
-  fs.appendFileSync('core/data/calls.log', phase + ':' + agent + '\\n');
-  if (phase === 'implement') {
-    fs.writeFileSync('core/src/example.js', 'module.exports = 2;\\n');
-    fs.appendFileSync('docs/HANDOFF.md', 'Verified implementation\\n');
-  }
-  const reject = fs.existsSync('core/data/reject-review');
-  const decision = { research: 'researched', plan: 'approve', implement: 'implemented', review: reject ? 'reject' : 'approve', diagnose: 'stop', repair: 'no_change', repair_review: 'approve' }[phase];
-  const result = { decision, summary: 'Fixture stage summary',
-    ...(phase === 'plan' ? { allowedFiles: ['core/src/example.js', 'docs/HANDOFF.md', 'web/src/example.js', 'core/test/behavior.test.js'], acceptanceChecks: ['example returns expected value'], baselineChecks: [] } : {}),
-    ...(['plan', 'review'].includes(phase) ? { feedbackReviewed: true, lessons: [] } : {}),
-    ...(phase === 'review' ? { githubResolutions: [] } : {}) };
-  if (agent === 'codex') {
-    if (process.argv.includes('--json')) process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SESSION.codex }) + '\\n');
-    fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], JSON.stringify(result));
-  } else process.stdout.write(JSON.stringify({ subtype: 'success', is_error: false, session_id: SESSION.claude, result: 'completed', structured_output: result }));
-});
-`;
+  const fakeCli = mainOwnedFixtureCli();
   try {
     write('core/scripts/run-evolution-team.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-team.js')));
+    write('core/scripts/run-evolution-main-mcp.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-main-mcp.js')));
+    write('core/scripts/evolution-apply-process.js', `module.exports = require(${JSON.stringify(require.resolve('../scripts/evolution-apply-process'))});`);
+    for (const name of ['evolution-main-workflow', 'evolution-main-mcp']) {
+      write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
+    }
     for (const name of ['activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-sessions', 'evolution-worktree']) {
       write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});\n`);
     }
     // 验证/反证只关心续接合同，不重复覆盖真实验证链路（上文真实 fixture 已覆盖）。
-    write('core/src/services/evolution-validation.js', 'module.exports.runEvolutionValidation = async () => ({ state: "passed", checks: ["backend"] });\n');
+    write('core/src/services/evolution-validation.js', `module.exports.runEvolutionValidation = async ({repoRoot}) => ({ state: 'passed', fingerprint: require(${JSON.stringify(require.resolve('../src/services/evolution-validation'))}).logicSnapshot(repoRoot).fingerprint, checks: ['backend','frontend'], checkedAt: Date.now() });\n`);
     write('core/src/services/evolution-countercheck.js', 'module.exports.runBaselineChecks = async () => ({ state: "passed", checks: [] });\n');
     write('core/src/services/evolution-references.js', 'module.exports.collectPublicReferences = async () => ({ state: "complete", discoveryComplete: true });\n');
     write('.gitignore', 'core/data/\n');
@@ -902,19 +781,19 @@ process.stdin.on('end', () => {
       });
     };
     const calls = () => fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8');
-    // run1：review 一路拒绝到预算耗尽，留下真实 in_run checkpoint（含脏树逐文件快照）。
+    // run1：Main 未封存候选即退出，留下真实 in_run checkpoint（含脏树逐文件快照）。
     write('core/data/reject-review', '1');
     write('core/data/calls.log', '');
     const exhausted = run('reject1');
     assert.equal(exhausted.status, 1, exhausted.stderr);
     assert.equal(git(['rev-parse', 'HEAD']), baseCommit, 'run1 不得提交');
     const journal1 = JSON.parse(fs.readFileSync(path.join(dir, 'core/data/logs/evolve-team-reject1.json'), 'utf8'));
-    assert.equal(journal1.terminationCode, 'recovery_exhausted');
+    assert.equal(journal1.failure.code, 'cli_exit', 'Main 未封存结果即退出，真实保留失败而不重开独立复核会话');
     const checkpoint = journal1.checkpoint;
     assert.ok(checkpoint && checkpoint.kind === 'in_run', 'run1 必须留下真实续接凭据');
     assert.deepEqual(Object.keys(checkpoint.fileFingerprints).sort(), ['core/src/example.js', 'docs/HANDOFF.md']);
     assert.ok(/^[0-9a-f]{64}$/.test(checkpoint.worktreeFingerprint));
-    // run2：同树合法续接——跳过 research/plan/implement，直接最终复核 + 提交。
+    // run2：同树合法续接——新 Main 继承原合同，重新验证后封存，不重复委派实施。
     fs.unlinkSync(path.join(dir, 'core/data/reject-review'));
     write('core/data/calls.log', '');
     const resumed = run('resume-ok', { resume: checkpoint });
@@ -922,7 +801,7 @@ process.stdin.on('end', () => {
     const resumedHead = git(['rev-parse', 'HEAD']);
     assert.notEqual(resumedHead, baseCommit);
     assert.equal(git(['status', '--porcelain']), '');
-    assert.equal(calls(), 'review:codex\n', '续接只应跑最终复核，不重开调研/实施');
+    assert.equal(calls(), 'main:codex\n', '续接只启动一个新 Main 检查已批准候选，不重新委派实施');
     const journal2 = readTeamJournal(path.join(dir, 'core/data/logs'), { runId: 'resume-ok', baseCommit, agent: 'codex', subAgent: 'claude', dualAgentEnabled: true });
     assert.equal(isTeamResultApproved(journal2, resumedHead), true);
     // 之后的拒绝用例都从基线重建 run1 留下的那棵脏树（内容/权限逐字节一致）。
@@ -930,7 +809,7 @@ process.stdin.on('end', () => {
       git(['reset', '--hard', baseCommit]);
       git(['clean', '-fdq']);
       write('core/src/example.js', 'module.exports = 2;\n');
-      write('docs/HANDOFF.md', 'Fixture constraints\nVerified implementation\n');
+      write('docs/HANDOFF.md', 'Fixture constraints\nWorker partial\nMain repaired and inspected actual candidate\n');
       write('core/data/calls.log', '');
     };
     const rejections = [
@@ -1370,7 +1249,7 @@ test('独立维护入口：真实 diagnose 批准编排文件→repair 补丁→
 
 // ---------------------------------------------------------------------------
 // Fresh stages accept valid outputs independently of native IDs.
-test('真实 runner：大事件、无原生 ID 与失败恢复均使用独立新会话', () => {
+test('真实 runner：大事件及无原生 ID 不影响单 Main，工具失败回同一 Main 完成', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'farm-team-session-'));
   const write = (file, data) => {
     const full = path.resolve(dir, file);
@@ -1379,57 +1258,18 @@ test('真实 runner：大事件、无原生 ID 与失败恢复均使用独立新
     fs.writeFileSync(full, data);
   };
   const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-  const fakeCli = `#!/usr/bin/env node
-const fs = require('node:fs');
-const SESSION = { claude: 'aaaa1111-2222-3333-4444-555566667777', codex: 'bbbb8888-9999-aaaa-bbbb-ccccddddeeee' };
-const DRIFT = 'dddd7777-8888-9999-aaaa-bbbbccccdddd';
-const mode = f => fs.existsSync(f);
-if (process.argv[2] === 'app-server' || process.argv.includes('resume') || process.argv.includes('--resume')) process.exit(9);
-let prompt = '';
-process.stdin.on('data', c => { prompt += c; });
-process.stdin.on('end', () => {
-  const agent = process.argv.includes('exec') ? 'codex' : 'claude';
-  if (prompt === '/compact' || process.env.DISABLE_AUTO_COMPACT !== '1') process.exit(9);
-  const phase = prompt.match(/只完成 (\\w+) 阶段/)[1];
-  fs.appendFileSync('core/data/calls.log', phase + ':' + agent + '\\n');
-  if (phase === 'implement') {
-    fs.writeFileSync('core/src/example.js', 'module.exports = 2;\\n');
-    fs.appendFileSync('docs/HANDOFF.md', 'Verified implementation\\n');
-  }
-  const decision = { research: 'researched', plan: 'approve', implement: 'implemented', review: 'approve', diagnose: 'repair', repair: 'no_change', repair_review: 'approve' }[phase];
-  const result = { decision, summary: 'Fixture stage summary',
-    ...(phase === 'diagnose' ? { allowedFiles: [] } : {}),
-    ...(phase === 'plan' ? { allowedFiles: ['core/src/example.js', 'docs/HANDOFF.md'], acceptanceChecks: ['example returns expected value'], baselineChecks: [] } : {}),
-    ...(['plan', 'review'].includes(phase) ? { feedbackReviewed: true, lessons: [] } : {}),
-    ...(phase === 'review' ? { githubResolutions: [] } : {}) };
-  if (agent === 'codex') {
-    if (mode('core/data/giant-events')) process.stdout.write('x'.repeat(2500000) + '\\n');
-    const resumeIndex = process.argv.indexOf('resume');
-    if (resumeIndex >= 0) {
-      if (process.argv[resumeIndex + 1] !== SESSION.codex) process.exit(3);
-      fs.appendFileSync('core/data/resume.log', process.argv[resumeIndex + 1] + '\\n');
-    }
-    if (mode('core/data/plan-fail-once') && resumeIndex < 0) {
-      process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SESSION.codex }) + '\\n');
-      fs.unlinkSync('core/data/plan-fail-once');
-      process.exit(1);
-    }
-    if (mode('core/data/drift')) {
-      process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SESSION.codex }) + '\\n');
-      process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: DRIFT }) + '\\n');
-    } else if (!mode('core/data/no-thread-events') && process.argv.includes('--json')) {
-      process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SESSION.codex }) + '\\n');
-    }
-    fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], JSON.stringify(result));
-  } else process.stdout.write(JSON.stringify({ subtype: 'success', is_error: false, session_id: SESSION.claude, result: 'completed', structured_output: result }));
-});
-`;
+  const fakeCli = mainOwnedFixtureCli();
   try {
     write('core/scripts/run-evolution-team.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-team.js')));
+    write('core/scripts/run-evolution-main-mcp.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-main-mcp.js')));
+    write('core/scripts/evolution-apply-process.js', `module.exports = require(${JSON.stringify(require.resolve('../scripts/evolution-apply-process'))});`);
+    for (const name of ['evolution-main-workflow', 'evolution-main-mcp']) {
+      write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
+    }
     for (const name of ['activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-sessions', 'evolution-worktree']) {
       write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});\n`);
     }
-    write('core/src/services/evolution-validation.js', 'module.exports.runEvolutionValidation = async () => ({ state: "passed", checks: ["backend"] });\n');
+    write('core/src/services/evolution-validation.js', `module.exports.runEvolutionValidation = async ({repoRoot}) => ({ state: 'passed', fingerprint: require(${JSON.stringify(require.resolve('../src/services/evolution-validation'))}).logicSnapshot(repoRoot).fingerprint, checks: ['backend','frontend'], checkedAt: Date.now() });\n`);
     write('core/src/services/evolution-countercheck.js', 'module.exports.runBaselineChecks = async () => ({ state: "passed", checks: [] });\n');
     write('core/src/services/evolution-references.js', 'module.exports.collectPublicReferences = async () => ({ state: "complete", discoveryComplete: true });\n');
     write('.gitignore', 'core/data/\n');
@@ -1480,7 +1320,6 @@ process.stdin.on('end', () => {
       git(['clean', '-fdq']);
     }
     write('core/data/calls.log', '');
-    write('core/data/plan-fail-once', '1');
     const failonce = run('failonce');
     assert.equal(failonce.status, 0, failonce.stderr);
     assert.notEqual(git(['rev-parse', 'HEAD']), baseCommit);
@@ -1490,6 +1329,7 @@ process.stdin.on('end', () => {
     const failonceJournal = journalOf('failonce');
     assert.equal(failonceJournal.lastFailure.code, 'cli_exit', '首轮失败按执行失败真实记录');
     assert.ok(failonceJournal.recoveryAttempt >= 1);
+    assert.equal(fs.readFileSync(path.join(dir, 'core/data/calls.log'), 'utf8'), 'main:codex\nworker:claude\n', '工具失败由同一 Main 处理，不重开独立审批会话');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

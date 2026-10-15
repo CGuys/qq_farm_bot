@@ -152,7 +152,7 @@ const EVOLVE_STATUS_LABELS: Record<string, string> = {
   deferred: '有人工改动，已延期',
   privacy_blocked: '隐私检查未通过',
   privacy_blocked_local: '本地改动待检查，已阻止推送',
-  review_blocked: '验收未通过，改动待返工',
+  review_blocked: '任务未完成，草稿已保留',
   no_change: '无需改动',
 }
 const evolveStatusLabel = computed(() => EVOLVE_STATUS_LABELS[evolve.value?.status || ''] || '空闲')
@@ -739,7 +739,7 @@ onUnmounted(() => evolutionStore.stopPolling())
             自动进化（活动 + 防封安全巡检）
           </h4>
           <p class="mt-1 text-xs text-purple-700/90 dark:text-purple-300/90">
-            每天北京时间 00:00-01:00 最多自动启动一轮，合并安全巡检和缓存活动核对。子 Agent 初检与实施，主 Agent 确认方案和最终验收；协调进程执行真实测试及批准的反向对照。{{ evolve?.autonomousEvolutionEnabled === true ? '完成的改动会自动应用生效。' : '完成后由你点「应用进化」生效。' }}
+            每天北京时间 00:00-01:00 合并巡检一次；自主开启后，新活动空闲时立即进化。主 Agent 持续统筹，按需调用子 Agent、检查并修正结果，统一验证验收；中间问题保留在面板，验收通过后通知。{{ evolve?.autonomousEvolutionEnabled === true ? '完成的改动会自动应用，就绪后通知。' : '验收通过后由你点「应用进化」生效。' }}
           </p>
         </div>
         <button
@@ -876,7 +876,7 @@ onUnmounted(() => evolutionStore.stopPolling())
           v-if="evolve?.status === 'review_blocked'"
           class="ml-2 rounded bg-purple-600 px-3 py-1.5 text-xs text-white transition hover:bg-purple-700 disabled:opacity-50"
           :disabled="reviewRetrying"
-          title="验收未通过轮的人工重试：从当前基线重开一轮综合巡检（安全巡检 + 缓存活动增量）。需先处理并提交工作区改动并与远端同步，后端仍会最终检查"
+          title="继续处理未完成任务。主 Agent 模式沿用原合同、草稿和批次；其他旧记录从当前基线复核，后端检查工作区、检查点和发布条件"
           @click="retryReviewBlocked"
         >
           {{ reviewRetrying ? '重试启动中…' : '重新验收并重试' }}

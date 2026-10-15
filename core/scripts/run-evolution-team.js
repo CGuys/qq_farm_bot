@@ -9,11 +9,13 @@ const { runEvolutionValidation } = require('../src/services/evolution-validation
 const { runBaselineChecks } = require('../src/services/evolution-countercheck');
 const { collectPublicReferences } = require('../src/services/evolution-references');
 const {
-  parseStageResult, runTeamWorkflow, teamJournalPath, buildStageSchema,
+  parseStageResult, teamJournalPath, buildStageSchema,
   createTeamError, normalizeTeamFailure, normalizeOrchestrationFiles, safeReviewFeedback,
-  normalizeCheckpoint, FULL_HANDOFF_MANDATE,
+  normalizeCheckpoint,
 } = require('../src/services/evolution-team');
 const { buildFreshHandoffContext } = require('../src/services/evolution-sessions');
+const { runMainOwnedWorkflow } = require('../src/services/evolution-main-workflow');
+const { collectProcesses, isDescendantOf, processStarttime, aliveNonZombie, signalGuarded } = require('./evolution-apply-process');
 
 const repoRoot = path.resolve(__dirname, '../..');
 
@@ -99,6 +101,8 @@ const ORCHESTRATION_FILES = new Set([
 ]);
 // 隐私控制与 hooks 只能人工审阅修改；编排文件另需主 Agent 验收列入 reviewedOrchestrationFiles。
 const PROTECTED_FILES = new Set([
+  'core/src/services/evolution-main-workflow.js', 'core/src/services/evolution-main-mcp.js',
+  'core/scripts/run-evolution-main-mcp.js',
   '.gitignore', 'core/src/services/privacy-guard.js', 'core/src/services/local-privacy-terms.js',
   'core/src/services/private-config.js', 'core/src/services/feishu-notify.js',
   'core/src/services/activity-evolver.js',
@@ -141,42 +145,45 @@ function inspectWorktree() {
 }
 
 function execute(bin, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    let child;
-    try {
-      child = spawn(bin, args, {
-        cwd: options.cwd || repoRoot,
-        env: options.env || buildEvolutionAgentEnv(),
-        stdio: ['pipe', options.capture ? 'pipe' : 'inherit', 'inherit'],
-        // 不 detached：所有 CLI/测试进程随协调进程一起终止。
-      });
-    } catch {
-      reject(createTeamError('cli_spawn'));
-      return;
+  return executeStreaming(bin, args, { ...options, echo: !options.capture });
+}
+
+function trackChildTree(child) {
+  const owned = new Map();
+  const rootStart = processStarttime(child.pid);
+  if (rootStart) owned.set(child.pid, rootStart);
+  const capture = () => {
+    const table = collectProcesses();
+    const anchors = [...owned].filter(([pid, start]) => table.get(pid)?.starttime === start).map(([pid]) => pid);
+    for (const [pid, stat] of table) {
+      if (anchors.some(anchor => isDescendantOf(pid, anchor, table))) owned.set(pid, stat.starttime);
     }
-    let stdout = '';
-    let overflow = false;
-    let spawnFailed = false;
-    child.stdout?.setEncoding('utf8');
-    child.stdout?.on('data', (chunk) => {
-      if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > 512 * 1024) {
-        overflow = true;
-        child.kill('SIGTERM');
-      } else stdout += chunk.toString();
-    });
-    child.stdin.on('error', () => {});
-    child.stdin.end(options.stdin || '');
-    child.once('error', () => {
-      spawnFailed = true;
-      reject(createTeamError('cli_spawn'));
-    });
-    child.once('close', (code, signal) => {
-      if (spawnFailed) return;
-      if (overflow) reject(createTeamError('output_limit', { exitCode: code }));
-      else if (code !== 0 || signal) reject(createTeamError('cli_exit', { exitCode: code, signal }));
-      else resolve(stdout);
-    });
-  });
+  };
+  capture();
+  const timer = setInterval(capture, 250);
+  timer.unref();
+  const live = () => [...owned].filter(([pid, start]) => aliveNonZombie(pid, start));
+  return {
+    capture,
+    stop: () => clearInterval(timer),
+    hasLive: () => live().length > 0,
+    async terminate() {
+      capture();
+      if (!rootStart) return false;
+      const started = Date.now();
+      // Every signal rechecks the recorded PID/starttime; never signal our shared
+      // process group, the coordinator or a sibling Main/worker.
+      while (Date.now() - started < 8000) {
+        capture();
+        const active = live();
+        if (!active.length) return true;
+        const signal = Date.now() - started >= 3000 ? 'SIGKILL' : 'SIGTERM';
+        for (const [pid, start] of active.reverse()) signalGuarded(pid, start, signal);
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      return live().length === 0;
+    },
+  };
 }
 
 // Codex --json 事件流执行：stdout 逐行有界解析（thread.started 携带真实线程 id），
@@ -187,17 +194,19 @@ function execute(bin, args, options = {}) {
 // 释放角色锁时不可能还有旧 Agent 进程在写（不吞掉再当成功）。
 function executeStreaming(bin, args, options = {}) {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) { reject(createTeamError('cli_exit', { signal: 'SIGTERM' })); return; }
     let child;
     try {
       child = spawn(bin, args, {
         cwd: options.cwd || repoRoot,
         env: options.env || buildEvolutionAgentEnv(),
-        stdio: ['pipe', 'pipe', 'inherit'],
+        stdio: ['pipe', 'pipe', options.logStderr ? 'pipe' : 'inherit'],
       });
     } catch {
       reject(createTeamError('cli_spawn'));
       return;
     }
+    const owned = trackChildTree(child);
     let logFd = null;
     if (options.eventLog) {
       try { logFd = fs.openSync(options.eventLog, 'a', 0o600); } catch { logFd = null; }
@@ -207,26 +216,48 @@ function executeStreaming(bin, args, options = {}) {
     let discarding = false;
     let spawnFailed = false;
     let rejected = false;
+    let stdout = '';
+    let timeout = null;
+    const onAbort = () => failLine(createTeamError('cli_exit', { signal: 'SIGTERM' }));
+    const cleanup = () => { clearTimeout(timeout); owned.stop(); options.signal?.removeEventListener('abort', onAbort); };
     const closeLog = () => { if (logFd != null) { try { fs.closeSync(logFd); } catch {} logFd = null; } };
     const failLine = (error) => {
       if (rejected) return;
       rejected = true;
-      // 只停自己启动的这一个子进程：TERM→有界 KILL，等真实退出（8s 硬上限）后
-      // 才 settle，失败绝无第二个执行器与本阶段重叠。
-      try { child.kill('SIGTERM'); } catch {}
-      const killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 3000);
-      const done = () => {
-        clearTimeout(killTimer);
+      // Keep the caller stopped until this CLI and every captured descendant has
+      // actually exited; an unproven cleanup blocks the whole candidate.
+      void owned.terminate().then(stopped => {
+        cleanup();
         closeLog();
-        reject(error?.code ? error : createTeamError('output_parse'));
-      };
-      child.once('close', done);
-      if (child.exitCode != null || child.signalCode) done();
-      else setTimeout(done, 8000);
+        const failure = stopped ? (error?.code ? error : createTeamError('output_parse')) : createTeamError('unsafe_worktree');
+        if (options.eventLog) failure.logFile = options.eventLog;
+        reject(failure);
+      }, () => {
+        cleanup(); closeLog();
+        reject(Object.assign(createTeamError('unsafe_worktree'), options.eventLog ? { logFile: options.eventLog } : {}));
+      });
     };
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.timeoutMs > 0) timeout = setTimeout(() => failLine(createTeamError('cli_exit')), options.timeoutMs);
+    if (options.signal?.aborted) onAbort();
     child.stdout.setEncoding('utf8');
+    if (options.logStderr && child.stderr) {
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', chunk => {
+        owned.capture();
+        if (logFd != null) { try { fs.writeSync(logFd, chunk); } catch {} }
+        process.stderr.write(chunk);
+      });
+    }
     child.stdout.on('data', (chunk) => {
+      owned.capture();
+      if (options.echo) process.stdout.write(chunk);
+      if (options.capture) {
+        if (Buffer.byteLength(stdout) + Buffer.byteLength(chunk) > 512 * 1024) { failLine(createTeamError('output_limit')); return; }
+        stdout += chunk;
+      }
       if (logFd != null) { try { fs.writeSync(logFd, chunk); } catch {} }
+      if (rejected) return;
       if (discarding) {
         // 丢弃模式：本块内没有换行就整块丢弃（一个字节都不保留）；遇到换行，其
         // 前的尾段属于超限事件一并丢弃，其后的数据恢复正常解析。
@@ -256,14 +287,20 @@ function executeStreaming(bin, args, options = {}) {
     child.stdin.end(options.stdin || '');
     child.once('error', () => {
       spawnFailed = true;
+      cleanup();
       closeLog();
       reject(createTeamError('cli_spawn'));
     });
     child.once('close', (code, signal) => {
-      closeLog();
       if (spawnFailed || rejected) return;
-      if (code !== 0 || signal) reject(createTeamError('cli_exit', { exitCode: code, signal }));
-      else resolve();
+      if (code !== 0 || signal) { failLine(createTeamError('cli_exit', { exitCode: code, signal })); return; }
+      if (owned.hasLive()) {
+        void owned.terminate().then(stopped => {
+          cleanup(); closeLog();
+          if (stopped) resolve(options.capture ? stdout : undefined);
+          else reject(createTeamError('unsafe_worktree'));
+        }, () => { cleanup(); closeLog(); reject(createTeamError('unsafe_worktree')); });
+      } else { cleanup(); closeLog(); resolve(options.capture ? stdout : undefined); }
     });
   });
 }
@@ -368,7 +405,8 @@ async function main(input) {
   process.umask(0o077);
   const { runId, baseCommit, settings, logDir, bins, prompt, task, dataDir, initialFailure, initialReviewFeedback } = input;
   const journalFile = teamJournalPath(logDir, runId);
-  const journal = { runId, baseCommit, mainAgent: settings.mainAgent, subAgent: settings.subAgent };
+  const journal = { runId, baseCommit, mainAgent: settings.mainAgent, subAgent: settings.subAgent,
+    orchestration: 'main-owned' };
   const persist = (fields) => {
     Object.assign(journal, fields);
     const temp = `${journalFile}.tmp`;
@@ -394,10 +432,16 @@ async function main(input) {
       if (['runtime', 'review'].includes(details.recoveryKind)) fields.recoveryKind = details.recoveryKind;
       fields.reviewFeedback = safeReviewFeedback(details.reviewFeedback, runtimeTerms);
       if (details.lastFailure && typeof details.lastFailure === 'object') fields.lastFailure = details.lastFailure;
+      if (details.orchestrationMode === 'main_owned') fields.orchestrationMode = 'main_owned';
+      fields.delegatedAgent = ['codex', 'claude'].includes(details.delegatedAgent) ? details.delegatedAgent : '';
     }
     persist(fields);
     process.stdout.write(`[team] ${phase} ${fields.activeAgent}${fields.recoveryAttempt ? ` recovery=${fields.recoveryAttempt}` : ''}\n`);
   };
+  const abort = new AbortController();
+  const abortRun = () => abort.abort();
+  process.on('SIGTERM', abortRun);
+  process.on('SIGINT', abortRun);
   try {
     if (inspectWorktree().head !== baseCommit) throw createTeamError('head_changed');
     // 续接入口：checkpoint 由协调进程生成并随 journal 0600 落盘，此处独立实测
@@ -414,67 +458,65 @@ async function main(input) {
       ? { ignored: liveHandoff.ignored, sha256: resume.handoffSha256 || null }
       : liveHandoff;
     // phase 标签保持合法枚举（'resume' 不在 PHASES 内，写入会让 journal 不可读）。
-    await onProgress('research', settings.subAgent, {});
+    await onProgress('plan', settings.mainAgent, { orchestrationMode: 'main_owned' });
     const references = resume ? null : await collectPublicReferences({ dataDir });
     const enrichedPrompt = `${prompt}${references ? `\n\n【本机每日公开项目发现记录（元数据检索，不等于代码已审）】\n${JSON.stringify(references)}\n子 Agent 按更新时间与更新活跃度检查本机配置的重点项目及完整候选清单；元数据不是源码审阅，未能访问或未深读的项目明确列为待评估，主 Agent 核实借鉴结论。` : ''}`;
-    const result = await runTeamWorkflow({
-      settings, prompt: enrichedPrompt, inspect: inspectWorktree, onProgress, initialFailure, initialReviewFeedback, verifyBaseline: true, dailyBrain: false, efficientMode: true,
-      resume, taskIdentity, preferDiagnosis: input.preferDiagnosis === true,
-      // roundId 由协调进程（evolver）生成并随轮次持久：同轮崩溃恢复恢复剩余预算，
-      // 退避后的新轮换新 id 才重置有界 2 次预算。runner 只透传，不自行生成。
-      roundId: typeof input.roundId === 'string' ? input.roundId.slice(0, 100) : '',
-      // checkpoint 落盘时并入本轮 HANDOFF 基线哈希：续接轮据此还原原基线。
-      onCheckpoint: async (value) => persist({ checkpoint: { ...value, handoffSha256: handoffBaseline.sha256 || '' } }),
-      runStage: async (phase, agent, stagePrompt) => {
-        // Prompt 始终走 stdin；阶段结构化输出由 schema 强约束，退出 0 不再当作交接成功。
-        // 每阶段独立全新 CLI 会话（owner 2026-10-09）：不传任何 resume id，不要求
-        // 原生会话 id 才接受结果——CLI 事件流里的原生 id 只是普通输出，不参与身份匹配。
-        const handoff = buildFreshHandoffContext({ handoffFile });
-        // 私有 HANDOFF 缺失是硬边界：research 只读阶段可如实报告，其余阶段没有
-        // 交接上下文就不得继续（更不得据此解析出 approve——不允许凭猜测状态放行）。
-        if (handoff.mode === 'missing' && phase !== 'research') throw createTeamError('missing_handoff');
-        // 有界摘录指令必须覆盖提示里所有完整重读硬性要求（首行模板之外，原任务/守则
-        // 文本里也可能嵌着同一句）；函数式替换避免 HANDOFF 内容中的 $ 序列被展开。
-        let injected = false;
-        const effectivePrompt = handoff.directive
-          ? stagePrompt.replaceAll(FULL_HANDOFF_MANDATE, () => {
-              if (injected) return '当前 HANDOFF 摘录已在本提示开头注入一次；按该摘录和标题锚点处理。';
-              injected = true;
-              return handoff.directive;
-            }) : stagePrompt;
-        const command = buildEvolutionAgentCommand(agent, effectivePrompt,
-          agent === 'codex' ? { jsonEvents: true } : {});
-        const schema = JSON.stringify(buildStageSchema(phase));
-        const args = [...command.args];
-        let response;
-        if (agent === 'codex') {
-          const schemaFile = path.join(logDir, `evolve-team-${runId}-${phase}-schema.json`);
-          const outputFile = path.join(logDir, `evolve-team-${runId}-${phase}.log`);
-          try {
-            fs.rmSync(outputFile, { force: true });
-            fs.writeFileSync(schemaFile, `${schema}\n`, { mode: 0o600 });
-          } catch { throw createTeamError('unknown'); }
-          args.splice(args.length - 1, 0, '--output-schema', schemaFile, '--output-last-message', outputFile);
-          try {
-            await executeStreaming(bins[agent], args, {
-              env, stdin: command.stdin,
-              eventLog: path.join(logDir, `evolve-team-${runId}-${phase}-events.log`),
-            });
-            response = readTeamStageOutput(outputFile);
-          } finally {
-            // Failed CLI/schema reads must not leave files mistaken for journals.
-            for (const temp of [schemaFile, outputFile]) {
-              try { fs.unlinkSync(temp); } catch { /* Keep private event evidence. */ }
-            }
-          }
-        } else {
-          args.push('--output-format', 'json', '--json-schema', schema);
-          const stdout = await execute(bins[agent], args, { env, stdin: command.stdin, capture: true });
-          response = claudeStageResponse(stdout);
+    const handoff = buildFreshHandoffContext({ handoffFile, maxBytes: 16 * 1024 });
+    if (handoff.mode === 'missing') throw createTeamError('missing_handoff');
+    const executeAgent = async (agent, { prompt: agentPrompt, schema, invocationId, mcp, signal }) => {
+      const command = buildEvolutionAgentCommand(agent, agentPrompt, agent === 'codex' ? { jsonEvents: true } : {});
+      const args = [...command.args];
+      const agentEnv = { ...env };
+      if (mcp) delete agentEnv.DISABLE_AUTO_COMPACT;
+      const schemaText = JSON.stringify(schema);
+      const eventLog = path.join(logDir, `evolve-team-${runId}-${invocationId}-events.log`);
+      const options = { env: agentEnv, stdin: command.stdin, signal,
+        timeoutMs: mcp ? 60 * 60 * 1000 : 30 * 60 * 1000, eventLog, logStderr: true };
+      let response;
+      if (agent === 'codex') {
+        const config = mcp
+          ? `mcp_servers={farm_evolution={command=${JSON.stringify(mcp.command)},args=${JSON.stringify(mcp.args)},required=true,startup_timeout_sec=15,tool_timeout_sec=1800}}`
+          : 'mcp_servers={}';
+        const schemaFile = path.join(logDir, `evolve-team-${runId}-${invocationId}-schema.json`);
+        const outputFile = path.join(logDir, `evolve-team-${runId}-${invocationId}.json`);
+        try {
+          fs.rmSync(outputFile, { force: true });
+          fs.writeFileSync(schemaFile, `${schemaText}\n`, { mode: 0o600 });
+          args.splice(args.length - 1, 0, '-c', config, '--output-schema', schemaFile, '--output-last-message', outputFile);
+          await executeStreaming(bins[agent], args, options);
+          response = readTeamStageOutput(outputFile);
+        } finally {
+          for (const file of [schemaFile, outputFile]) { try { fs.unlinkSync(file); } catch {} }
         }
-        return parseStageResult(response, phase, runtimeTerms);
+      } else {
+        args.push('--json-schema', schemaText, '--strict-mcp-config', '--mcp-config', JSON.stringify({
+          mcpServers: mcp ? { farm_evolution: mcp } : {},
+        }));
+        response = claudeStageResponse(await execute(bins[agent], args, { ...options, capture: true }));
+      }
+      return response;
+    };
+    let verificationNumber = 0;
+    const result = await runMainOwnedWorkflow({
+      settings, prompt: enrichedPrompt, baseCommit, task, logDir, dataDir, runId,
+      signal: abort.signal,
+      inspect: inspectWorktree, onProgress, initialFailure, initialReviewFeedback,
+      resume, taskIdentity, handoffDirective: handoff.directive,
+      roundId: typeof input.roundId === 'string' ? input.roundId.slice(0, 100) : '',
+      onCheckpoint: async value => persist({ checkpoint: { ...value, handoffSha256: handoffBaseline.sha256 || '' } }),
+      runMain: async options => {
+        const text = await executeAgent(settings.mainAgent, { ...options, invocationId: 'main' });
+        try { return JSON.parse(text); } catch { throw createTeamError('invalid_output'); }
       },
-      verify: async ({ reviewedOrchestrationFiles, baselineChecks = [] } = {}) => {
+      runWorker: async options => {
+        const text = await executeAgent(settings.subAgent, { ...options, schema: buildStageSchema('implement') });
+        return { ...parseStageResult(text, 'implement', runtimeTerms),
+          logFile: path.join(logDir, `evolve-team-${runId}-${options.invocationId}-events.log`) };
+      },
+      verify: async ({ reviewedOrchestrationFiles, baselineChecks = [], signal } = {}) => {
+        const logFile = path.join(logDir, `evolve-team-${runId}-verification-${++verificationNumber}.log`);
+        fs.writeFileSync(logFile, '', { mode: 0o600 });
+        let check = 'validation';
         const { files } = inspectWorktree();
         const reviewed = new Set(normalizeOrchestrationFiles(reviewedOrchestrationFiles));
         for (const file of files) {
@@ -496,14 +538,34 @@ async function main(input) {
           throw createTeamError('missing_handoff');
         }
         try {
-          const validation = await runEvolutionValidation({ repoRoot, dataDir, execute, env });
+          const validation = await runEvolutionValidation({ repoRoot, dataDir,
+            execute: (bin, args, options) => {
+              check = String(options?.cwd || '').endsWith(`${path.sep}web`) ? 'frontend' : 'backend';
+              return execute(bin, args, { ...options, signal, eventLog: logFile, logStderr: true });
+            }, env });
+          check = 'countercheck';
           validation.countercheck = await runBaselineChecks({ repoRoot, dataDir, baseCommit, checks: baselineChecks, env });
+          validation.logFile = logFile;
+          fs.appendFileSync(logFile, `\n${JSON.stringify({ checks: validation.checks, countercheck: validation.countercheck })}\n`);
           persist({ validation });
           return validation;
         } catch (error) {
           // 真实测试/构建失败归为验证未通过并保留退出码；执行器无法启动等问题保留原类别。
           if (error?.code === 'cli_exit' || /^EVOLUTION_(?:VALIDATION|COUNTERCHECK)_/.test(String(error?.code || ''))) {
-            throw createTeamError('verification_failed', { exitCode: error.exitCode, signal: error.signal });
+            let excerpt = '';
+            try {
+              const fd = fs.openSync(logFile, 'r');
+              try {
+                const size = fs.fstatSync(fd).size;
+                const buffer = Buffer.alloc(Math.min(size, 32 * 1024));
+                fs.readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length));
+                excerpt = safeReviewFeedback(buffer.toString('utf8').split('\n')
+                  .filter(line => /not ok |error TS|Error:|ERR_/.test(line)).slice(-3)
+                  .map(line => line.slice(0, 300)).join('; '), runtimeTerms);
+              } finally { fs.closeSync(fd); }
+            } catch { /* The fixed failure class remains truthful without a readable log. */ }
+            throw Object.assign(createTeamError('verification_failed', { exitCode: error.exitCode, signal: error.signal }),
+              { logFile, failureSummary: `${check}: ${excerpt || 'registered check failed'}` });
           }
           throw error;
         }
@@ -548,10 +610,14 @@ async function main(input) {
     const terminationCode = ['recovery_exhausted', 'plan_exhausted'].includes(String(error?.code))
       ? String(error.code) : '';
     persist({ ...counters, ...(terminationCode ? { terminationCode } : {}), phase: 'failed', status: 'failed', activeAgent: '', failure,
+      lastFailure: info.lastFailure ? normalizeTeamFailure(info.lastFailure) : failure,
       ...(info.recoveryKind ? { recoveryKind: info.recoveryKind } : {}),
       reviewFeedback: safeReviewFeedback(info.reviewFeedback || journal.reviewFeedback, runtimeTerms), completedAt: Date.now() });
     process.stderr.write(`Team evolution failed: ${failure.code}\n`);
     process.exitCode = 1;
+  } finally {
+    process.removeListener('SIGTERM', abortRun);
+    process.removeListener('SIGINT', abortRun);
   }
 }
 

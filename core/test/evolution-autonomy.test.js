@@ -167,7 +167,7 @@ const CHILD_SOURCE = [
   'write(".gitignore", "core/data/\\ntmp/\\n");',
   'write("docs/HANDOFF.md", "Fixture constraints\\n");',
   'write("core/src/example.js", "module.exports = 1;\\n");',
-  'write("core/test/example.test.js", "require(\\"node:assert/strict\\").ok([1,2].includes(require(\\"../src/example\\")));\\n");',
+  'write("core/test/example.test.js", "require(\\"node:assert/strict\\").ok([1,3].includes(require(\\"../src/example\\")));\\n");',
   'git(["init", "-q"]);',
   'git(["config", "user.name", "Autonomy fixture"]);',
   'git(["config", "user.email", "fixture@users.noreply.github.com"]);',
@@ -304,7 +304,7 @@ const CHILD_SOURCE = [
   '    autonomy: { originalPrompt: prompt } });',
   '  await service.runAutonomyStep();',
   '  state = readState();',
-  '  out.validationDeferKey = state.autonomy.notifiedKey;',
+  '  out.validationDeferKey = state.autonomy.lastReworkKey;',
   '  out.validationApplyAttempts = state.autonomy.applyAttempts;',
   '  out.validationStillPending = state.status === "pending_apply";',
   '  // API 隐私：公开状态不带原 prompt/续接计划/checkpoint。',
@@ -433,6 +433,14 @@ test('重启按剩余退避续等：不延长成新整段、不归零', () => {
 // 是 Parent 实际喂入的持久凭据），不另记手动日期、不重采批次、发布到远端后
 // pending_apply。人工按钮无参语义由 evolution-review-retry 既有用例守护。
 // ---------------------------------------------------------------------------
+const FRONTEND_CHILD_LINES = [
+  "write(\"web/src/example.js\", \"export default 1;\\n\");",
+  "write(\"web/package.json\", JSON.stringify({scripts:{build:\"node build.cjs\"}}));",
+  "write(\"web/build.cjs\", \"const fs=require('node:fs'),p=require('node:path');const out=p.resolve(process.argv[process.argv.indexOf('--outDir')+1]);const boundary=REPLACE_BOUNDARY;if(out!==boundary&&!out.startsWith(boundary+p.sep))throw Error('fixture_escape');fs.mkdirSync(out,{recursive:true});const file=p.resolve(out,'index.html');if(!file.startsWith(out+p.sep))throw Error('fixture_escape');fs.writeFileSync(file,'fixture UI');\".replace(\"REPLACE_BOUNDARY\",JSON.stringify(dir)));",
+  "write(\"web/node_modules/.bin/vue-tsc\", \"#!/usr/bin/env node\\n\", 0o700);",
+  "write(\"web/node_modules/.bin/vite\", \"#!/usr/bin/env node\\nrequire('../../build.cjs');\\n\", 0o700);",
+];
+
 const LEGACY_CHILD_SOURCE = [
   'const fs = require("node:fs");',
   'const os = require("node:os");',
@@ -461,7 +469,10 @@ const LEGACY_CHILD_SOURCE = [
   'const git = args => execFileSync("git", args, { cwd: dir, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }).trim();',
   'const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));',
   'async function wait(predicate, label) {',
-  '  for (let i = 0; i < 400; i++) { const value = predicate(); if (value) return value; await sleep(150); }',
+  "  for (let i = 0; i < 400; i++) { const value = predicate(); if (value) return value;",
+  "    if (fs.existsSync(statePath)) { const live=JSON.parse(fs.readFileSync(statePath,\"utf8\"));",
+  "      if ([\"failed\",\"review_blocked\"].includes(live.status)&&!live.activeRun) throw Error(\"terminal_\"+live.status+\":\"+live.summary); }",
+  "    await sleep(150); }",
   '  throw new Error("timeout_" + label);',
   '}',
   // 真实 Parent 源码 + re-export shim（依赖指回候选仓真实模块；scheduler 同实例）。
@@ -475,6 +486,11 @@ const LEGACY_CHILD_SOURCE = [
   '  write(relative, "module.exports=require(" + JSON.stringify(actual) + ");\\n");',
   '}',
   'write("core/scripts/run-evolution-team.js", fs.readFileSync(path.join(candidate, "core/scripts/run-evolution-team.js")));',
+  "for (const name of [\"evolution-main-workflow\", \"evolution-main-mcp\"]) {",
+  "  write(\"core/src/services/\"+name+\".js\", \"module.exports=require(\"+JSON.stringify(path.join(candidate,\"core/src/services/\"+name+\".js\"))+\");\\n\");",
+  "}",
+  "write(\"core/scripts/evolution-apply-process.js\", \"module.exports=require(\"+JSON.stringify(path.join(candidate,\"core/scripts/evolution-apply-process.js\"))+\");\\n\");",
+  "write(\"core/scripts/run-evolution-main-mcp.js\", \"require(\"+JSON.stringify(path.join(candidate,\"core/scripts/run-evolution-main-mcp.js\"))+\");\\n\");",
   // runner 独有依赖：countercheck 用真实模块；references 需要脱敏发现桩（不联网）。
   'write("core/src/services/evolution-countercheck.js", "module.exports=require("',
   '  + JSON.stringify(path.join(candidate, "core/src/services/evolution-countercheck.js")) + ");\\n");',
@@ -488,48 +504,16 @@ const LEGACY_CHILD_SOURCE = [
   'write(".gitignore", "core/data/\\ntmp/\\n");',
   'write("docs/HANDOFF.md", "Fixture constraints\\n");',
   'write("core/src/example.js", "module.exports = 1;\\n");',
-  'write("core/test/example.test.js", "require(\\"node:test\\")(\\"fixture\\",()=>require(\\"node:assert/strict\\").ok([1,2].includes(require(\\"../src/example\\"))));\\n");',
+  'write("core/test/example.test.js", "require(\\"node:test\\")(\\"fixture\\",()=>require(\\"node:assert/strict\\").ok([1,3].includes(require(\\"../src/example\\"))));\\n");',
   // 真实 CLI 桩：initialFailure 恢复链 diagnose→repair→repair_review 后全新
   // research→plan→implement→review；plan 给出真实批准范围，implement 真实写文件。
-  'const callsLog = path.join(dir, "core/data/calls.log");',
-  'const cli = `#!/usr/bin/env node',
-  'const fs=require("node:fs");',
-  'const SESSION={claude:"aaaa1111-2222-3333-4444-555566667777",codex:"bbbb8888-9999-aaaa-bbbb-ccccddddeeee"};',
-  'if(process.argv[2]==="app-server"){let buffer="";process.stdin.setEncoding("utf8");',
-  'process.stdin.on("data",chunk=>{buffer+=chunk;let index;',
-  'while((index=buffer.indexOf("\\\\n"))>=0){const line=buffer.slice(0,index);buffer=buffer.slice(index+1);',
-  'if(!line)continue;let value;try{value=JSON.parse(line);}catch{continue;}',
-  'if(value.id===undefined||!value.method)continue;',
-  'const reply=result=>process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:value.id,result})+"\\\\n");',
-  'if(value.method==="thread/read"||value.method==="thread/resume")reply({thread:{id:value.params.threadId}});',
-  'else if(value.method==="thread/compact/start"){reply({});',
-  'for(const method of ["item/started","item/completed"])process.stdout.write(JSON.stringify({jsonrpc:"2.0",method,params:{threadId:value.params.threadId,item:{type:"contextCompaction"}}})+"\\\\n");',
-  '}else reply({});}});return;}',
-  'let prompt="";',
-  'process.stdin.setEncoding("utf8");',
-  'process.stdin.on("data",c=>prompt+=c);',
-  'process.stdin.on("end",()=>{',
-  ' if(prompt==="/compact"){',
-  '  process.stdout.write(JSON.stringify({type:"system",subtype:"compact_boundary",session_id:SESSION.claude})+"\\\\n");',
-  '  process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,session_id:SESSION.claude})+"\\\\n");return;}',
-  ' const phase=prompt.match(/只完成 (\\\\w+) 阶段/)[1];',
-  // Stage C：Agent CLI 的 cwd 是隔离任务工作区（其 core/data 不在提交里），
-  // 调用流水必须写回 fixture 的绝对路径，测试侧才能读到完整批准链。
-  // eslint-disable-next-line no-template-curly-in-string
-  ' fs.appendFileSync(${JSON.stringify(callsLog)},phase+":"+(process.argv.includes("exec")?"codex":"claude")+"\\\\n");',
-  ' const decisions={research:"researched",revise_plan:"researched",plan:"approve",implement:"implemented",review:"approve",diagnose:"repair",repair:"no_change",repair_review:"approve",patch_review:"approve"};',
-  ' const result={decision:decisions[phase],summary:"Legacy synthetic stage"};',
-  ' if(phase==="plan"){result.allowedFiles=["core/src/example.js","docs/HANDOFF.md"];result.acceptanceChecks=["example stays within synthetic values"];result.baselineChecks=[];}',
-  ' if(phase==="diagnose")result.allowedFiles=[];',
-  ' if(["plan","review"].includes(phase)){result.feedbackReviewed=false;result.lessons=[];}',
-  ' if(phase==="review")result.githubResolutions=[];',
-  ' if(phase==="implement"){fs.writeFileSync("core/src/example.js","module.exports = 2;\\\\n");fs.appendFileSync("docs/HANDOFF.md","B2 chain update\\\\n");}',
-  ' if(process.argv.includes("exec")){',
-  '  if(process.argv.includes("--json"))process.stdout.write(JSON.stringify({type:"thread.started",thread_id:SESSION.codex})+"\\\\n");',
-  '  fs.writeFileSync(process.argv[process.argv.indexOf("--output-last-message")+1],JSON.stringify(result));}',
-  ' else process.stdout.write(JSON.stringify({subtype:"success",is_error:false,session_id:SESSION.claude,structured_output:result}));',
-  '});`;',
-'write("core/data/fake-cli", cli, 0o700);',
+  ...FRONTEND_CHILD_LINES,
+  'const callsLog = path.join(dir, "core/data/native-calls.jsonl");',
+  "let cli = require(path.join(candidate, \"core/test/evolution-main-runner.test.js\")).NATIVE_CLI;",
+  "cli = cli.replace(\"provider=path.basename(process.argv[1]).includes('claude')?'claude':'codex'\", \"provider=process.argv.includes('exec')?'codex':'claude'\");",
+  "cli = cli.replace(\"if(full!==root&&!full.startsWith(root+path.sep))\", \"if(full!==\" + JSON.stringify(dir) + \"&&!full.startsWith(\" + JSON.stringify(dir) + \"+path.sep))\");",
+  "cli = cli.replace(\"append('core/data/native-calls.jsonl',\", \"if(main)write(\" + JSON.stringify(path.join(dir,\"core/data/main-prompt.txt\")) + \",input);append(\" + JSON.stringify(callsLog) + \",\");",
+  "write(\"core/data/fake-cli\", cli, 0o700);",
   'git(["init", "-q", "-b", "main"]);',
   'git(["config", "user.name", "Legacy autonomy fixture"]);',
   'git(["config", "user.email", "fixture@users.noreply.github.com"]);',
@@ -565,14 +549,17 @@ const LEGACY_CHILD_SOURCE = [
   'const out = { legacyThroughAt, injectedHook, envClean };',
   '(async () => {',
   '  await service.runAutonomyStep();',
+  '  service.setAutonomousEvolution(false);',
   '  const state = await wait(() => {',
   '    const value = JSON.parse(fs.readFileSync(statePath, "utf-8"));',
   '    return value.status === "pending_apply" && !value.activeRun ? value : false;',
   '  }, "pending_apply");',
-  // 拿到结果立即关自主（撤定时器，绝不让后续 apply 步骤在测试环境里跑停服助手）。
+  // 启动后已通过真实开关禁止后续自动应用；正在执行的 Main 必须正常验收并发布。
   '  service.setAutonomousEvolution(false);',
   '  out.status = state.status;',
-  '  out.calls = fs.readFileSync(path.join(dir, "core/data/calls.log"), "utf-8").trim().split("\\n");',
+  "  out.calls = fs.readFileSync(callsLog,\"utf-8\").trim().split(\"\\n\").map(line=>{const call=JSON.parse(line);return call.kind+\":\"+call.provider;});",
+  "  const firstMainPrompt=fs.readFileSync(path.join(dir,\"core/data/main-prompt.txt\"),\"utf-8\");",
+  "  out.firstFailureVisible=firstMainPrompt.includes('\"code\":\"cli_exit\"')&&firstMainPrompt.includes('\"phase\":\"review\"');",
   '  out.firstCall = out.calls[0];',
   '  out.feedbackThroughAt = state.feedbackBatch ? state.feedbackBatch.throughAt : 0;',
   '  out.lastAutomaticEvolveDate = state.lastAutomaticEvolveDate;',
@@ -639,7 +626,7 @@ function runLegacyChild(capturedPlan = false) {
   }
 }
 
-test('legacy review_blocked 自主接管：真实 Parent+runner 首跳新诊断，批次/水位/名额身份全程保持', () => {
+test('legacy review_blocked 自主接管：真实 Parent持续Main读取旧失败，批次/水位/名额身份全程保持', () => {
   // 注入守卫必须留在夹具之外：测试进程 env 前后一致（隔离只发生在合成夹具内）。
   const guardBefore = { count: process.env.GIT_CONFIG_COUNT,
     key: process.env.GIT_CONFIG_KEY_0, value: process.env.GIT_CONFIG_VALUE_0 };
@@ -654,13 +641,11 @@ test('legacy review_blocked 自主接管：真实 Parent+runner 首跳新诊断�
   assert.ok(String(out.injectedHook).includes('evolution-hooks'),
     '子进程必须真实运行在生产形态的 hook 注入环境下');
   assert.equal(out.envClean, true, '夹具进程内的 GIT_CONFIG_* 必须在首个 git 调用前隔离');
-  // 首跳 = 主 Agent 对旧底层失败（cli_exit review，diagnosis_stopped 回退）的
-  // 真实新诊断，不是 research 盲跑，也不是把旧 stop 翻成 approve。
-  assert.equal(out.firstCall, 'diagnose:codex');
-  for (const stage of ['research', 'plan', 'implement', 'review']) {
-    assert.ok(out.calls.some(call => call.startsWith(`${stage}:`)),
-      `无旧 checkpoint 的 legacy 轮必须走全新批准链（缺 ${stage}）：${out.calls}`);
-  }
+  // A single owning Main receives the genuine old failure and calls one scoped
+  // worker; its tool approval/verification replaces independent native stages.
+  assert.equal(out.firstCall, 'main:codex');
+  assert.equal(out.firstFailureVisible, true, '旧底层 cli_exit/review 必须进入当前 Main 上下文');
+  assert.deepEqual(out.calls, ['main:codex', 'worker:claude']);
   assert.equal(out.status, 'pending_apply');
   assert.equal(out.published, out.commit, '真实提交必须已发布到远端');
   assert.equal(out.cleanTree, true);
@@ -730,6 +715,11 @@ const B2_CHILD_SOURCE = [
   '  write(relative, "module.exports=require(" + JSON.stringify(actual) + ");\\n");',
   '}',
   'write("core/scripts/run-evolution-team.js", fs.readFileSync(path.join(candidate, "core/scripts/run-evolution-team.js")));',
+  "for (const name of [\"evolution-main-workflow\", \"evolution-main-mcp\"]) {",
+  "  write(\"core/src/services/\"+name+\".js\", \"module.exports=require(\"+JSON.stringify(path.join(candidate,\"core/src/services/\"+name+\".js\"))+\");\\n\");",
+  "}",
+  "write(\"core/scripts/evolution-apply-process.js\", \"module.exports=require(\"+JSON.stringify(path.join(candidate,\"core/scripts/evolution-apply-process.js\"))+\");\\n\");",
+  "write(\"core/scripts/run-evolution-main-mcp.js\", \"require(\"+JSON.stringify(path.join(candidate,\"core/scripts/run-evolution-main-mcp.js\"))+\");\\n\");",
   'write("core/src/services/evolution-countercheck.js", "module.exports=require("',
   '  + JSON.stringify(path.join(candidate, "core/src/services/evolution-countercheck.js")) + ");\\n");',
   'write("core/src/services/evolution-references.js", "module.exports={...require("',
@@ -740,54 +730,18 @@ const B2_CHILD_SOURCE = [
   // 副作用边界桩：真实 helper 的进程启动（停服/重启）不在本用例范围——前置门
   // （候选绑定/任务区核验/验证记录/运行时区准备/私有记录）全部真实执行。
   'const applyArgsLog = path.join(dir, "core/data/apply-args.jsonl");',
-  'write("core/scripts/evolution-apply-process.js",',
-  '  "#!/usr/bin/env node\\n" +',
-  '  "const fs=require(\'node:fs\');const path=require(\'node:path\');" +',
-  '  "const dataDir=path.resolve(process.argv[process.argv.indexOf(\'--data-dir\')+1]);" +',
-  '  "fs.appendFileSync(path.join(dataDir,\'apply-args.jsonl\'),JSON.stringify(process.argv.slice(2))+\\"\\\\n\\");\\n");',
+  "write(\"core/scripts/evolution-apply-process.js\", \"#!/usr/bin/env node\\n\" + \"if(require.main!==module){module.exports=require(REPLACE_HELPER);}else{const fs=require('node:fs'),path=require('node:path');const dataDir=path.resolve(process.argv[process.argv.indexOf('--data-dir')+1]);const file=path.resolve(dataDir,'apply-args.jsonl');if(!file.startsWith(dataDir+path.sep))throw Error('fixture_escape');fs.appendFileSync(file,JSON.stringify(process.argv.slice(2))+'\\\\n');}\".replace(\"REPLACE_HELPER\",JSON.stringify(path.join(candidate,\"core/scripts/evolution-apply-process.js\"))));",
   'write(".gitignore", "core/data/\\ntmp/\\n");',
   'write("docs/HANDOFF.md", "Fixture constraints\\n");',
   'write("core/src/example.js", "module.exports = 1;\\n");',
-  'write("core/test/example.test.js", "require(\\"node:test\\")(\\"fixture\\",()=>require(\\"node:assert/strict\\").ok([1,2].includes(require(\\"../src/example\\"))));\\n");',
-  'const callsLog = path.join(dir, "core/data/calls.log");',
-  'const cli = `#!/usr/bin/env node',
-  'const fs=require("node:fs");',
-  'const SESSION={claude:"aaaa1111-2222-3333-4444-555566667777",codex:"bbbb8888-9999-aaaa-bbbb-ccccddddeeee"};',
-  'if(process.argv[2]==="app-server"){let buffer="";process.stdin.setEncoding("utf8");',
-  'process.stdin.on("data",chunk=>{buffer+=chunk;let index;',
-  'while((index=buffer.indexOf("\\\\n"))>=0){const line=buffer.slice(0,index);buffer=buffer.slice(index+1);',
-  'if(!line)continue;let value;try{value=JSON.parse(line);}catch{continue;}',
-  'if(value.id===undefined||!value.method)continue;',
-  'const reply=result=>process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:value.id,result})+"\\\\n");',
-  'if(value.method==="thread/read"||value.method==="thread/resume")reply({thread:{id:value.params.threadId}});',
-  'else if(value.method==="thread/compact/start"){reply({});',
-  'for(const method of ["item/started","item/completed"])process.stdout.write(JSON.stringify({jsonrpc:"2.0",method,params:{threadId:value.params.threadId,item:{type:"contextCompaction"}}})+"\\\\n");',
-  '}else reply({});}});return;}',
-  'let prompt="";',
-  'process.stdin.setEncoding("utf8");',
-  'process.stdin.on("data",c=>prompt+=c);',
-  'process.stdin.on("end",()=>{',
-  ' if(prompt==="/compact"){',
-  '  process.stdout.write(JSON.stringify({type:"system",subtype:"compact_boundary",session_id:SESSION.claude})+"\\\\n");',
-  '  process.stdout.write(JSON.stringify({type:"result",subtype:"success",is_error:false,session_id:SESSION.claude})+"\\\\n");return;}',
-  ' const phase=prompt.match(/只完成 (\\\\w+) 阶段/)[1];',
-  // Stage C：Agent CLI 的 cwd 是隔离任务工作区（其 core/data 不在提交里），
-  // 调用流水必须写回 fixture 的绝对路径，测试侧才能读到完整批准链。
-  // eslint-disable-next-line no-template-curly-in-string
-  ' fs.appendFileSync(${JSON.stringify(callsLog)},phase+":"+(process.argv.includes("exec")?"codex":"claude")+"\\\\n");',
-  ' const decisions={research:"researched",revise_plan:"researched",plan:"approve",implement:"implemented",review:"approve",diagnose:"repair",repair:"no_change",repair_review:"approve",patch_review:"approve"};',
-  ' const result={decision:decisions[phase],summary:"B2 synthetic stage"};',
-  ' if(phase==="plan"){result.allowedFiles=["core/src/example.js","docs/HANDOFF.md"];result.acceptanceChecks=["example stays within synthetic values"];result.baselineChecks=[];}',
-  ' if(phase==="diagnose")result.allowedFiles=[];',
-  ' if(["plan","review"].includes(phase)){result.feedbackReviewed=false;result.lessons=[];}',
-  ' if(phase==="review")result.githubResolutions=[];',
-  ' if(phase==="implement"){fs.writeFileSync("core/src/example.js","module.exports = 2;\\\\n");fs.appendFileSync("docs/HANDOFF.md","B2 chain update\\\\n");}',
-  ' if(process.argv.includes("exec")){',
-  '  if(process.argv.includes("--json"))process.stdout.write(JSON.stringify({type:"thread.started",thread_id:SESSION.codex})+"\\\\n");',
-  '  fs.writeFileSync(process.argv[process.argv.indexOf("--output-last-message")+1],JSON.stringify(result));}',
-  ' else process.stdout.write(JSON.stringify({subtype:"success",is_error:false,session_id:SESSION.claude,structured_output:result}));',
-  '});`;',
-'write("core/data/fake-cli", cli, 0o700);',
+  'write("core/test/example.test.js", "require(\\"node:test\\")(\\"fixture\\",()=>require(\\"node:assert/strict\\").ok([1,3].includes(require(\\"../src/example\\"))));\\n");',
+  ...FRONTEND_CHILD_LINES,
+  'const callsLog = path.join(dir, "core/data/native-calls.jsonl");',
+  "let cli = require(path.join(candidate, \"core/test/evolution-main-runner.test.js\")).NATIVE_CLI;",
+  "cli = cli.replace(\"provider=path.basename(process.argv[1]).includes('claude')?'claude':'codex'\", \"provider=process.argv.includes('exec')?'codex':'claude'\");",
+  "cli = cli.replace(\"if(full!==root&&!full.startsWith(root+path.sep))\", \"if(full!==\" + JSON.stringify(dir) + \"&&!full.startsWith(\" + JSON.stringify(dir) + \"+path.sep))\");",
+  "cli = cli.replace(\"append('core/data/native-calls.jsonl',\", \"if(main)write(\" + JSON.stringify(path.join(dir,\"core/data/main-prompt.txt\")) + \",input);append(\" + JSON.stringify(callsLog) + \",\");",
+  "write(\"core/data/fake-cli\", cli, 0o700);",
   'git(["init", "-q", "-b", "main"]);',
   'git(["config", "user.name", "B2 apply fixture"]);',
   'git(["config", "user.email", "fixture@users.noreply.github.com"]);',
@@ -868,13 +822,16 @@ const B2_CHILD_SOURCE = [
   '  fs.writeFileSync(path.join(dir, "core/src/dirty-hold.js"), "module.exports = \'hold\';\\n");',
   '  fs.appendFileSync(path.join(dir, "core/src/example.js"), "// dirty hold\\n");',
   '  out.rootDirtyBefore = gitIn(dir, ["status", "--porcelain"]) !== "";',
-  '  fs.writeFileSync(path.join(dataDir, "evolution-validation.json"), JSON.stringify({',
-  '    version: 1, state: "passed", checkedAt: Date.now(),',
-  '    fingerprint: logicSnapshot(out.candidateTaskRoot).fingerprint, checks: ["backend"] }));',
+  "  const validation = await require(path.join(candidate,\"core/src/services/evolution-validation.js\")).runEvolutionValidation({",
+  "    repoRoot:out.candidateTaskRoot,dataDir,env:{...process.env,PATH:path.dirname(process.execPath)+path.delimiter+process.env.PATH},",
+  "    execute:async(bin,args,options)=>{execFileSync(bin,args,{...options,stdio:[\"ignore\",\"pipe\",\"pipe\"]});},",
+  "  });",
+  "  out.validationChecks = validation.checks;",
   '  // 正例（重启退回后的再次应用）：原库脏 + 同一提交 → 既有运行时区幂等复用，',
   '  // 不因 runtime_workspace_exists 卡死，私有记录与内容指纹保持一致。',
   '  const applied = service.applyEvolution("manual");',
   '  out.applyOk = applied.ok === true;',
+  '  if(!applied.ok) throw Error("manual_apply:"+applied.error);',
   '  out.applyError = applied.error || "";',
   '  await wait(() => argsLines().length >= 2, "second helper 桩落盘");',
   '  const lines = argsLines();',
@@ -952,6 +909,7 @@ test('B2 已提交候选：真实 Parent 全链到 pending_apply 后，漂移拒
   assert.equal(out.mismatchRejected, true, 'candidateTaskRoot 绑定不符必须被拒');
   assert.equal(out.noSpawnOnMismatch, true);
   assert.equal(out.rootDirtyBefore, true, '应用前原库应保持脏（真实保留物形态）');
+  assert.deepEqual(out.validationChecks, ['backend', 'frontend'], '再次应用前须取得真实完整验证记录');
   assert.equal(out.applyOk, true, `重启退回后同提交再次应用必须成功（运行时区幂等复用）：${out.applyError}`);
   assert.equal(out.spawnCount, 2, '自主应用 + 重启退回后的手动再应用各启动一次');
   assert.equal(out.autoHelperHead, out.commit, '自主应用 helper 期望提交 = 已审提交（严格同提交）');

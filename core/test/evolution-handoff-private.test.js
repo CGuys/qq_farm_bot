@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { execFileSync, spawnSync } = require('node:child_process');
 const { test } = require('node:test');
 
@@ -21,77 +22,53 @@ const HANDOFF_TEXT = 'Fixture private constraints\n';
 
 test('ignored 私有 HANDOFF：真实更新通过、未更新/缺失/不可读拒绝、无代码不强求', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'farm-team-private-handoff-'));
+  const sourceFingerprint = () => [__filename, require.resolve('../src/services/evolution-team')].map(file => [file,
+    crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'), fs.lstatSync(file).mode & 0o777]);
+  const originalSources = sourceFingerprint();
   const write = (file, text) => {
-    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
-    fs.writeFileSync(path.join(dir, file), text);
+    const full = path.resolve(dir, file);
+    if (!full.startsWith(`${dir}${path.sep}`)) throw new Error('fixture_escape');
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, text);
   };
   const git = args => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const journalOf = runId => JSON.parse(fs.readFileSync(path.join(dir, 'core/data/logs', `evolve-team-${runId}.json`), 'utf8'));
   try {
     write('core/scripts/run-evolution-team.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-team.js')));
-    for (const name of ['activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-validation', 'evolution-countercheck', 'evolution-sessions', 'evolution-worktree']) {
+    write('core/scripts/run-evolution-main-mcp.js', fs.readFileSync(path.join(__dirname, '../scripts/run-evolution-main-mcp.js')));
+    write('core/scripts/evolution-apply-process.js', `module.exports=require(${JSON.stringify(require.resolve('../scripts/evolution-apply-process'))});`);
+    for (const name of ['evolution-main-workflow', 'evolution-main-mcp', 'activity-evolver', 'privacy-guard', 'evolution-team', 'evolution-validation', 'evolution-countercheck', 'evolution-sessions', 'evolution-worktree']) {
       write(`core/src/services/${name}.js`, `module.exports = require(${JSON.stringify(require.resolve(`../src/services/${name}`))});`);
     }
     write('core/src/services/evolution-references.js', 'module.exports.collectPublicReferences = async () => ({state:"complete", discoveryComplete:true});\n');
-    write('.gitignore', 'core/data/\n');
+    write('.gitignore', 'core/data/\nweb/node_modules/\nweb/dist/\n');
     write('docs/HANDOFF.md', HANDOFF_TEXT);
     write('core/src/example.js', 'module.exports = 1;\n');
     write('core/test/example.test.js', 'require("node:assert/strict").ok([1, 2].includes(require("../src/example")));\n');
-    const fakeCli = `#!/usr/bin/env node
-const fs = require('node:fs');
-const SESSION = { claude: 'aaaa1111-2222-3333-4444-555566667777', codex: 'bbbb8888-9999-aaaa-bbbb-ccccddddeeee' };
-if (process.argv[2] === 'app-server') {
-  let buffer = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => {
-    buffer += chunk;
-    let index;
-    while ((index = buffer.indexOf('\\n')) >= 0) {
-      const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      let value; try { value = JSON.parse(line); } catch { continue; }
-      if (value.id === undefined || !value.method) continue;
-      const reply = result => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: value.id, result }) + '\\n');
-      if (value.method === 'thread/read' || value.method === 'thread/resume') reply({ thread: { id: value.params.threadId } });
-      else if (value.method === 'thread/compact/start') {
-        reply({});
-        for (const method of ['item/started', 'item/completed']) {
-          process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params: { threadId: value.params.threadId, item: { type: 'contextCompaction' } } }) + '\\n');
-        }
-      } else reply({});
-    }
-  });
-  return;
-}
-let prompt = '';
-process.stdin.on('data', c => { prompt += c; });
-process.stdin.on('end', () => {
-  if (prompt === '/compact') {
-    process.stdout.write(JSON.stringify({ type: 'system', subtype: 'compact_boundary', session_id: SESSION.claude }) + '\\n');
-    process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: SESSION.claude }) + '\\n');
-    return;
-  }
-  const phase = prompt.match(/只完成 (\\w+) 阶段/)[1];
-  if (phase === 'implement' && !fs.existsSync('core/data/skip-code')) {
-    fs.writeFileSync('core/src/example.js', fs.existsSync('core/data/break-tests') ? 'module.exports = 3;\\n' : 'module.exports = 2;\\n');
-    if (!fs.existsSync('core/data/skip-handoff')) fs.appendFileSync('docs/HANDOFF.md', 'Verified implementation\\n');
-    if (fs.existsSync('core/data/force-stage-handoff')) require('node:child_process').execFileSync('git', ['add', '-f', 'docs/HANDOFF.md'], { stdio: 'ignore' });
-    if (fs.existsSync('core/data/unignore-handoff')) fs.writeFileSync('.git/info/exclude', fs.readFileSync('.git/info/exclude', 'utf8').replace('docs/HANDOFF.md\\n', ''));
-  }
-  const decision = { research: 'researched', plan: 'approve', implement: 'implemented', review: 'approve', diagnose: 'repair', repair: 'no_change', repair_review: 'approve' }[phase];
-  const result = {decision, summary: 'Verified fixture change', ...(phase === 'diagnose' ? {allowedFiles: []} : {}), ...(phase === 'plan' ? {allowedFiles:['core/src/example.js','docs/HANDOFF.md','core/test/behavior.test.js'], acceptanceChecks:['example returns expected value'], baselineChecks:[]} : {})};
-  const schemaIndex = process.argv.indexOf('--output-schema');
-  if (schemaIndex >= 0) {
-    if (!JSON.parse(fs.readFileSync(process.argv[schemaIndex + 1])).properties.decision.enum.includes(decision)) throw new Error('Missing stage schema');
-    if (process.argv.includes('--json')) process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: SESSION.codex }) + '\\n');
-    fs.writeFileSync(process.argv[process.argv.indexOf('--output-last-message') + 1], JSON.stringify(result));
-  } else {
-    const jsonIndex = process.argv.indexOf('--json-schema');
-    if (jsonIndex < 0 || !JSON.parse(process.argv[jsonIndex + 1]).properties.decision.enum.includes(decision)) throw new Error('Missing stage schema');
-    process.stdout.write(JSON.stringify({subtype:'success', is_error:false, session_id: SESSION.claude, result:'completed', structured_output:result}));
-  }
-});
-`;
+    // The real complete verifier expects this repository's frontend check as well.
+    // Both executables are local synthetic tools, and build output is isolated.
+    write('web/package.json', JSON.stringify({ scripts: { build: 'node build.cjs' } }));
+    write('web/build.cjs', 'const fs=require("node:fs"),p=require("node:path"),out=process.argv[process.argv.indexOf("--outDir")+1];if(!out)throw Error("isolated output required");fs.mkdirSync(out,{recursive:true});fs.writeFileSync(p.join(out,"index.html"),"fixture UI");');
+    write('web/node_modules/.bin/vue-tsc', '#!/usr/bin/env node\n');
+    write('web/node_modules/.bin/vite', '#!/usr/bin/env node\nrequire("../../build.cjs");\n');
+    for (const file of ['web/node_modules/.bin/vue-tsc', 'web/node_modules/.bin/vite']) fs.chmodSync(path.join(dir, file), 0o700);
+
+    const { NATIVE_CLI } = require('./evolution-main-runner.test');
+    let fakeCli = NATIVE_CLI.replace("provider=path.basename(process.argv[1]).includes('claude')?'claude':'codex'", "provider=argv.includes('exec')?'codex':'claude'");
+    const workerStart = fakeCli.indexOf(" write('core/src/example.js','module.exports = 2;");
+    const workerEnd = fakeCli.indexOf('}else{', workerStart);
+    assert.ok(workerStart > 0 && workerEnd > workerStart);
+    fakeCli = fakeCli.slice(0, workerStart) + String.raw` if(!fs.existsSync('core/data/skip-code')){
+  write('core/src/example.js',fs.existsSync('core/data/break-tests')?'module.exports = 3;\n':'module.exports = 2;\n');
+  if(!fs.existsSync('core/data/skip-handoff'))append('docs/HANDOFF.md','Verified implementation\n');
+  if(fs.existsSync('core/data/force-stage-handoff'))cp.execFileSync('git',['add','-f','docs/HANDOFF.md'],{stdio:'ignore'});
+  if(fs.existsSync('core/data/unignore-handoff'))write('.git/info/exclude',fs.readFileSync(inside('.git/info/exclude'),'utf8').replace('docs/HANDOFF.md\n',''));
+ }
+ emit({decision:fs.existsSync('core/data/skip-code')?'no_change':'implemented',summary:'Actual private-handoff fixture edit'});
+` + fakeCli.slice(workerEnd);
+    fakeCli = fakeCli.replace("if(!worker.isError)throw Error('Fixture expected a worker exit failure');", "if(worker.isError)throw Error(worker.content[0].text);");
+    fakeCli = fakeCli.replace('workerFailed:true', 'workerFailed:false');
+    fakeCli = fakeCli.replace("  write('core/src/example.js','module.exports = 3;\\n');append('docs/HANDOFF.md','Main repaired and inspected actual candidate\\n');", '');
     write('core/data/fake-agent', fakeCli);
     fs.chmodSync(path.join(dir, 'core/data/fake-agent'), 0o700);
     fs.mkdirSync(path.join(dir, 'core/data/logs'), { recursive: true });
@@ -215,5 +192,8 @@ process.stdin.on('end', () => {
     assert.equal(unignored.status, 1);
     assert.equal(git(['rev-parse', 'HEAD']), baseCommit, '中途变可见的私有 HANDOFF 绝不能被提交');
     assert.equal(journalOf('private-unignored-midrun').failure.code, 'unsafe_worktree');
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    try { assert.deepEqual(sourceFingerprint(), originalSources); }
+    finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
 });
