@@ -72,5 +72,5 @@ test('管理面板真实渲染奶茶说明的已适配与占地/图标/自动样
     if(spec==='@/api')return {__esModule:true,default:{}};
   });
   const root=makeNode('root');activeRoots.push(root);render(vue.h(Panel),root);await flush(); await vue.nextTick(); assert.equal(loads, 1, '真实mounted读取状态');
-  assert.match(textOf(root),/奶茶工坊与果实加工/);assert.match(textOf(root),/森野黄金芽四格与专属图片缺口/);assert.match(textOf(root),/自然成功样本/);render(null,root);
+  assert.match(textOf(root),/奶茶工坊与果实加工/);assert.match(textOf(root),/森野黄金芽四格映射和本期种子、果实专属图已核验/);assert.match(textOf(root),/自然成功样本/);render(null,root);
 });

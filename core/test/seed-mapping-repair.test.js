@@ -29,14 +29,14 @@ test('observed seed has reviewed explicit size2 and correct seed-to-fruit mappin
   assert.equal(p.id, 1029005); assert.equal(p.size, 2); assert.deepEqual(p.fruit, { id: 49005, count: 10 }); assert.equal(p.land_level_need, 1);
   assert.equal(config.getItemById(29005).name, '森野黄金芽种子'); assert.equal(config.getPlantByFruitId(49005).id, p.id);
 });
-test('actual Bag decoding returns mapped size2 with no footprint fallback while retaining the icon gap', async t => {
+test('actual Bag decoding returns mapped size2 with no footprint fallback with its delivered exclusive icon', async t => {
   const f = fixture(t, [{ id: 29005, count: 1, uid: 7001 }]), bag = await f.warehouse.getBagDetail();
   assert.equal(bag.items.find(x => x.id === 29005)?.plantSize, 2);
   const [seed] = f.warehouse.getBagSeedsFromItems([{ id: 29005, count: 1 }]);
   assert.equal(seed.mappingStatus, 'mapped'); assert.equal(seed.plantSize, 2); assert.equal(seed.requiredLevel, 1);
   assert.equal(f.logs.filter(x => x.meta?.event === 'bag_seed_detect').length, 0);
   assert.equal(bag.seedRecognition.issues.some(x => x.itemId === 29005 && x.kind === 'seed_footprint_unverified'), false);
-  assert.ok(bag.seedRecognition.issues.some(x => x.itemId === 29005 && x.kind === 'seed_icon_missing'));
+  assert.equal(bag.seedRecognition.issues.some(x => x.itemId === 29005 && x.kind === 'seed_icon_missing'), false);
   assert.deepEqual(f.calls.map(x => x.method), ['Bag']);
 });
 test('known missing mappings enter the real inbox once per added set, independent of order and duplicate stacks', t => {

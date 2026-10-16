@@ -547,8 +547,11 @@ test('活动与安全进化共用历史踩坑回归硬门', () => {
   assert.match(guardrails, /严禁执行 git push/);
   // 图标抓取与背包种子闭环硬门（2026-09-11）
   assert.match(guardrails, /npm run fetch:official-icons/);
-  assert.match(guardrails, /抓到的 PNG 属于新增二进制，绝对禁止 git add/);
-  assert.match(guardrails, /待人工提交/);
+  assert.match(guardrails, /主Agent核验来源、原始尺寸、Git blob\/SHA-256和实际图片内容/);
+  assert.match(guardrails, /主Agent完整验收当前HEAD/);
+  assert.match(guardrails, /其他二进制仍拦截，不关闭或绕过隐私扫描/);
+  assert.match(guardrails, /不得把正常资源核验、提交和应用交给用户手工参与/);
+  assert.doesNotMatch(guardrails, /绝对禁止 git add|待人工提交/);
   assert.match(guardrails, /bag_unclassified_item/);
   assert.match(guardrails, /背包种植不是白名单/);
   assert.match(guardrails, /活动 Agent 的每日职责固定为五个闭环/);

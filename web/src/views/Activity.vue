@@ -1,9 +1,9 @@
 <script setup lang="ts">
+import type { MilkTeaQueryKind } from '@/stores/activity'
 import { storeToRefs } from 'pinia'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 // 上一期 BearActivityPanel 已退役；只保留历史迁移定位，默认页面仅挂载当前奶茶面板。
 import MilkTeaActivityPanel from '@/components/activity/MilkTeaActivityPanel.vue'
-import type { MilkTeaQueryKind } from '@/stores/activity'
 import AdminActivityUpdatePanel from '@/components/admin/AdminActivityUpdatePanel.vue'
 import EvolutionAgentSettings from '@/components/admin/EvolutionAgentSettings.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
@@ -142,22 +142,24 @@ onMounted(() => {
 </script>
 
 <template>
-  <section class="space-y-4">
-    <header class="relative min-h-36 overflow-hidden rounded-lg from-slate-800 via-sky-800 to-indigo-900 bg-gradient-to-r shadow-sm">
-      <div class="absolute -right-12 -top-20 h-64 w-64 rounded-full bg-sky-300/15 blur-3xl" />
-      <div class="relative flex min-h-40 flex-col justify-between gap-4 p-4 xl:flex-row xl:items-center">
-        <div class="flex min-w-0 items-center gap-3">
+  <section class="activity-page space-y-4">
+    <header class="relative overflow-hidden rounded-xl from-slate-800 via-sky-800 to-indigo-900 bg-gradient-to-r shadow-sm">
+      <div class="absolute h-64 w-64 rounded-full bg-sky-300/15 blur-3xl -right-12 -top-20" />
+      <div class="relative flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div class="min-w-0 flex items-center gap-3">
           <span class="grid h-12 w-12 shrink-0 place-items-center rounded-xl bg-white/10 text-3xl text-sky-100">
             <span class="i-carbon-events" />
           </span>
           <div>
-            <h1 class="text-xl text-white font-bold">活动中心</h1>
+            <h1 class="text-xl text-white font-bold">
+              活动中心
+            </h1>
             <div class="mt-1 text-xs text-sky-100/75">
               当前账号 {{ currentAccount?.name || '未选择' }} · 查看进行中的活动与奖励
             </div>
           </div>
         </div>
-        <div class="flex min-w-0 flex-wrap items-center gap-2 xl:max-w-[68%] xl:justify-end">
+        <div class="min-w-0 flex flex-wrap items-center gap-2">
           <BaseButton variant="primary" :loading="milkTeaLoading" :disabled="!currentAccountId" @click="refreshAll">
             刷新
           </BaseButton>
@@ -180,17 +182,54 @@ onMounted(() => {
       请先选择账号，再查看活动数据。
     </div>
     <template v-else>
-      <div v-if="milkTeaError && !milkTeaRetired" class="rounded bg-red-50 p-3 text-red-600">{{ milkTeaError }}</div>
-      <section v-if="hasVisibleActivity" class="rounded-lg bg-white p-4 shadow dark:bg-gray-800">
-        <h2>一键领取</h2><p>仅领取奶茶活动的每日快乐值与合格档位奖励；每项领取前重新校验资格。</p>
-        <button :disabled="claimAllRunning || !!milkTeaOperating" @click="claimAll">一键领取</button>
-        <button v-if="claimAllRunning" @click="activityStore.cancelClaimAll()">停止后续领取</button>
-        <p v-if="claimAllStep">{{ claimAllStep }}</p>
-        <p v-for="result in claimAllResults" :key="result.key">{{ result.label }} · {{ result.status === 'success' ? '成功' : result.status === 'failed' ? '失败' : '跳过' }} · {{ result.detail }}</p>
+      <div v-if="milkTeaError && !milkTeaRetired" class="act-alert act-alert-error" role="alert">
+        {{ milkTeaError }}
+      </div>
+      <section v-if="hasVisibleActivity" class="act-card flex flex-col gap-3">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0">
+            <h2 class="text-sm text-gray-900 font-bold dark:text-white">
+              一键领取
+            </h2>
+            <p class="mt-1 text-xs text-gray-500 leading-5 dark:text-gray-400">
+              仅领取奶茶活动的每日快乐值与合格档位奖励；每项领取前重新校验资格。
+            </p>
+          </div>
+          <div class="act-actions">
+            <BaseButton variant="primary" :loading="claimAllRunning" :disabled="claimAllRunning || !!milkTeaOperating" @click="claimAll">
+              一键领取
+            </BaseButton>
+            <BaseButton v-if="claimAllRunning" variant="outline" @click="activityStore.cancelClaimAll()">
+              停止后续领取
+            </BaseButton>
+          </div>
+        </div>
+        <p v-if="claimAllStep" role="status" class="act-note">
+          <span class="i-svg-spinners-ring-resize animate-spin" aria-hidden="true" />{{ claimAllStep }}
+        </p>
+        <ul v-if="claimAllResults.length" class="act-rows">
+          <li v-for="result in claimAllResults" :key="result.key">
+            <span
+              class="act-badge"
+              :class="result.status === 'success' ? 'act-badge-success' : result.status === 'failed' ? 'act-badge-failed' : 'act-badge-skipped'"
+            >{{ result.status === 'success' ? '成功' : result.status === 'failed' ? '失败' : '跳过' }}</span>
+            <span class="min-w-0 flex-1 break-words">{{ result.label }} · {{ result.detail }}</span>
+          </li>
+        </ul>
       </section>
-      <section v-if="operationFeedback && !milkTeaRetired" class="rounded bg-white p-3 dark:bg-gray-800">
-        <p>{{ operationFeedback.message || operationFeedback.error || '操作回复已返回，请核对最新状态' }}</p>
-        <p v-for="(row, index) in operationFeedback.results || []" :key="index">槽位 {{ Number(row.slotIndex) + 1 }}：{{ row.success ? '已雇佣' : row.errorMsg || '未成功' }}</p>
+      <section
+        v-if="operationFeedback && !milkTeaRetired"
+        class="act-card flex flex-col gap-2"
+        :class="operationFeedback.ok === true ? 'act-card-ok' : 'act-card-error'"
+      >
+        <p class="break-words text-sm text-gray-900 font-medium leading-6 dark:text-white">
+          {{ operationFeedback.message || operationFeedback.error || '操作回复已返回，请核对最新状态' }}
+        </p>
+        <ul v-if="operationFeedback.results?.length" class="act-rows">
+          <li v-for="(row, index) in operationFeedback.results || []" :key="index">
+            槽位 {{ Number(row.slotIndex) + 1 }}：{{ row.success ? '已雇佣' : row.errorMsg || '未成功' }}
+          </li>
+        </ul>
       </section>
       <MilkTeaActivityPanel v-if="!milkTeaRetired" :key="String(currentAccountId)" :activity="milkTeaActivity" :loading="milkTeaLoading" :operating="milkTeaOperating || (claimAllRunning ? 'claimAll' : '')" :queries="milkTeaQueries" @refresh="refreshMilkTea" @query="queryMilkTea" @operate="operateMilkTea" />
       <p v-if="!hasVisibleActivity" class="rounded-lg bg-white p-8 text-center text-sm text-gray-500 dark:bg-gray-800">
@@ -206,7 +245,9 @@ onMounted(() => {
           活动管理 <span :class="showActivityManagement ? 'i-carbon-chevron-up' : 'i-carbon-chevron-down'" />
         </button>
         <div v-if="showActivityManagement" id="activity-management" class="mt-2 rounded-lg bg-gray-50 p-3 space-y-2 dark:bg-gray-800/60">
-          <p class="text-xs">如活动再次开放，可手动检查并恢复显示。</p>
+          <p class="text-xs">
+            如活动再次开放，可手动检查并恢复显示。
+          </p>
           <div v-for="kind in retiredKinds" :key="kind" class="flex flex-wrap items-center justify-between gap-2">
             <span>{{ RETIRED_LABELS[kind] }}</span>
             <BaseButton variant="secondary" @click="recheck(kind)">
@@ -226,11 +267,15 @@ onMounted(() => {
         aria-label="活动分析"
         @click.self="showActivityAnalysis = false"
       >
-        <div class="flex max-h-[92vh] w-full max-w-7xl flex-col overflow-hidden rounded-xl bg-white shadow-2xl dark:bg-gray-800">
+        <div class="max-h-[92vh] max-w-7xl w-full flex flex-col overflow-hidden rounded-xl bg-white shadow-2xl dark:bg-gray-800">
           <header class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-gray-200 px-4 py-3 dark:border-gray-700">
             <div>
-              <h2 class="font-semibold text-gray-900 dark:text-white">活动分析</h2>
-              <p class="mt-0.5 text-xs text-gray-500">在线发现未适配活动并读取只读活动树</p>
+              <h2 class="text-gray-900 font-semibold dark:text-white">
+                活动分析
+              </h2>
+              <p class="mt-0.5 text-xs text-gray-500">
+                在线发现未适配活动并读取只读活动树
+              </p>
             </div>
             <div class="min-w-0 flex items-center gap-3">
               <EvolutionAgentSettings />
@@ -251,3 +296,100 @@ onMounted(() => {
     </Teleport>
   </section>
 </template>
+
+<style scoped>
+.activity-page {
+  min-width: 0;
+}
+.activity-page :deep(button) {
+  min-height: 42px;
+}
+.activity-page .text-xs {
+  overflow-wrap: anywhere;
+}
+.act-card {
+  padding: 18px 22px;
+  border: 1px solid var(--surface-border, rgba(15, 23, 42, 0.09));
+  border-radius: 14px;
+  background: var(--surface-1, #fff);
+}
+.act-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.act-actions :deep(button) {
+  min-height: 42px;
+}
+.act-alert {
+  padding: 13px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.act-alert-error {
+  background: color-mix(in srgb, #ef4444 9%, transparent);
+  color: #b91c1c;
+}
+.act-note {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  line-height: 1.8;
+  color: var(--muted-text, #64748b);
+}
+.act-rows {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.act-rows li {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.act-badge {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.act-badge-success {
+  background: rgba(34, 197, 94, 0.1);
+  color: #15803d;
+}
+.act-badge-failed {
+  background: rgba(239, 68, 68, 0.1);
+  color: #b91c1c;
+}
+.act-badge-skipped {
+  background: var(--surface-2, #f8fafc);
+  color: var(--muted-text, #64748b);
+}
+.dark .act-alert-error,
+.dark .act-badge-failed {
+  color: #fca5a5;
+}
+.dark .act-badge-success {
+  color: #86efac;
+}
+@media (max-width: 700px) {
+  .act-card {
+    padding: 16px;
+  }
+  .act-card :deep(button) {
+    min-height: 42px;
+  }
+  .act-actions {
+    width: 100%;
+  }
+}
+</style>

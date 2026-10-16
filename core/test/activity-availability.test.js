@@ -75,7 +75,10 @@ function compileSfcModule(absPath, resolve) {
   const source = fs.readFileSync(absPath, 'utf8');
   const { descriptor, errors } = sfcCompiler.parse(source, { filename: absPath });
   assert.deepEqual(errors.map(String), [], `SFC 解析失败: ${absPath}`);
-  const script = sfcCompiler.compileScript(descriptor, { id: path.basename(absPath), inlineTemplate: true });
+  // The test host models VNodes, not a browser HTML parser. Keep static subtrees
+  // as VNodes so the same real templates retain all interaction assertions.
+  const script = sfcCompiler.compileScript(descriptor, { id: path.basename(absPath), inlineTemplate: true,
+    templateOptions: { compilerOptions: { hoistStatic: false } } });
   assert.deepEqual((script.errors || []).map(String), [], `SFC 编译失败: ${absPath}`);
   const cjs = ts.transpileModule(script.content, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ESNext },
@@ -86,6 +89,7 @@ function compileSfcModule(absPath, resolve) {
     const value = resolve(spec, absPath);
     if (value !== undefined)
       return value;
+    if (spec === 'vue-router') return vueRouter;
     let target = null;
     if (spec.startsWith('@/'))
       target = path.join(WEB, 'src', spec.slice(2));
