@@ -17,6 +17,12 @@ function replaceModules(replacements) {
 function fixture(t, items = [], sale = false) {
   const logs = [], calls = [], utils = require('../src/utils/utils'), store = require('../src/models/store');
   t.after(replaceModules([
+    ['../src/config/gameConfig', { ...config,
+      getItemById: id => [29981, 29982].includes(Number(id))
+        ? { id: Number(id), type: 5, name: Number(id) === 29981 ? '合成种子甲' : '合成种子乙', evidence: 'synthetic fixture' }
+        : config.getItemById(id),
+      isSeedItem: id => [29981, 29982].includes(Number(id)) || config.isSeedItem(id),
+    }],
     ['../src/utils/network', { getUserState: () => ({ accountId: 'fixture-account', level: 1, gold: 0 }), getWsErrorState: () => null,
       sendMsgAsync: async (service, method) => { calls.push({ service, method }); assert.equal(method, 'Bag', 'no unconfirmed game write'); return { body: types.BagReply.encode({ item_bag: { items } }).finish() }; } }],
     ['../src/utils/utils', { ...utils, log: (_tag, message, meta) => logs.push({ message, meta }), logWarn: () => {} }],
@@ -41,21 +47,21 @@ test('actual Bag decoding returns mapped size2 with no footprint fallback with i
 });
 test('known missing mappings enter the real inbox once per added set, independent of order and duplicate stacks', t => {
   const f = fixture(t), count = () => inbox.getRuntimeIssueSnapshot().find(x => x.key === 'bag_seed_mapping')?.count || 0, start = count();
-  f.warehouse.getBagSeedsFromItems([{ id: 20529, count: 1 }, { id: 20529, count: 2 }]);
-  f.warehouse.getBagSeedsFromItems([{ id: 20529, count: 5 }]);
+  f.warehouse.getBagSeedsFromItems([{ id: 29981, count: 1 }, { id: 29981, count: 2 }]);
+  f.warehouse.getBagSeedsFromItems([{ id: 29981, count: 5 }]);
   assert.equal(count(), start + 1, 'known seeds without Plant must enter automatic evolution feedback');
-  f.warehouse.getBagSeedsFromItems([{ id: 20529, count: 1 }, { id: 20528, count: 1 }]);
-  f.warehouse.getBagSeedsFromItems([{ id: 20528, count: 2 }, { id: 20529, count: 1 }]);
+  f.warehouse.getBagSeedsFromItems([{ id: 29981, count: 1 }, { id: 29982, count: 1 }]);
+  f.warehouse.getBagSeedsFromItems([{ id: 29982, count: 2 }, { id: 29981, count: 1 }]);
   assert.equal(count(), start + 2);
-  f.warehouse.getBagSeedsFromItems([{ id: 20529, count: 1 }]); assert.equal(count(), start + 2, 'disappearance is not new feedback');
+  f.warehouse.getBagSeedsFromItems([{ id: 29981, count: 1 }]); assert.equal(count(), start + 2, 'disappearance is not new feedback');
   const logs = f.logs.filter(x => x.meta?.event === 'bag_seed_detect'); assert.equal(logs.length, 3);
-  assert.deepEqual(logs[0].meta.addedSeedIds, [20529]); assert.equal(logs[0].meta.count, 1);
-  for (const row of logs) assert.doesNotMatch(row.message, /20528|20529/); assert.deepEqual(f.calls, []);
+  assert.deepEqual(logs[0].meta.addedSeedIds, [29981]); assert.equal(logs[0].meta.count, 1);
+  for (const row of logs) assert.doesNotMatch(row.message, /29982|29981/); assert.deepEqual(f.calls, []);
 });
 test('cleared sets report later recurrence; unrelated unverified seed size remains zero', t => {
   const f = fixture(t), start = inbox.getRuntimeIssueSnapshot().find(x => x.key === 'bag_seed_mapping')?.count || 0;
-  f.warehouse.getBagSeedsFromItems([{ id: 20529, count: 1 }]); f.warehouse.getBagSeedsFromItems([{ id: 29005, count: 1 }]);
-  const [seed] = f.warehouse.getBagSeedsFromItems([{ id: 20529, count: 1 }]); assert.equal(seed.plantSize, 0); assert.equal(config.getPlantBySeedId(20529), undefined);
+  f.warehouse.getBagSeedsFromItems([{ id: 29981, count: 1 }]); f.warehouse.getBagSeedsFromItems([{ id: 29005, count: 1 }]);
+  const [seed] = f.warehouse.getBagSeedsFromItems([{ id: 29981, count: 1 }]); assert.equal(seed.plantSize, 0); assert.equal(config.getPlantBySeedId(29981), undefined);
   assert.equal(inbox.getRuntimeIssueSnapshot().find(x => x.key === 'bag_seed_mapping')?.count, start + 2);
   assert.deepEqual(config.getGenericFallbackItemIds(), []);
 });
@@ -64,7 +70,7 @@ test('old seed feedback acknowledgement preserves a later occurrence without ide
   const batch = inbox.toRuntimeIssueBatch(inbox.getRuntimeIssueSnapshot(now)); assert.equal(inbox.recordRuntimeIssue('bag_seed_mapping', 'warn', now + 1000), true);
   inbox.acknowledgeRuntimeIssues(batch, now + 1000); const issue = inbox.getRuntimeIssueSnapshot(now + 1000).find(x => x.key === 'bag_seed_mapping');
   assert.ok(issue); assert.equal(issue.count, 1); assert.equal(issue.lastAt, now + 1000);
-  assert.doesNotMatch(fs.readFileSync(path.join(privateDir, 'evolution-runtime-issues.json'), 'utf8'), /29005|20529|account|gid|token|https?:/);
+  assert.doesNotMatch(fs.readFileSync(path.join(privateDir, 'evolution-runtime-issues.json'), 'utf8'), /29005|29981|29982|account|gid|token|https?:/);
 });
 test('new plant identity does not authorize the conditional-sale activity fruit for automatic sale', async t => {
   assert.ok(config.getPlantByFruitId(49005), 'normal fruit identity is mapped');
