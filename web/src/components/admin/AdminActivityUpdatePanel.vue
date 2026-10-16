@@ -314,7 +314,7 @@ interface ActivityRuleInsight {
 
 const ACTIVITY_RULE_INSIGHT_DEFINITIONS: Array<Omit<ActivityRuleInsight, 'evidence'> & { pattern: RegExp }> = [
   { key: 'milk-tea-shop', title: '奶茶开店、升级与收银台', description: '已接入奶茶专属面板、摘要与显式查询；开店、改名、升级、领取仅用户手动确认。', kind: 'gameplay', pattern: /开店营业|升级小店|收银台/ },
-  { key: 'milk-tea-workshop', title: '奶茶工坊与果实加工', description: '已接入配方与背包果实显式查询、唯一条目和锁定校验；森野黄金芽四格映射和本期种子、果实专属图已核验；其余未证植物映射仍保留未知占地。', kind: 'gameplay', pattern: /种植加工|奶茶工坊/ },
+  { key: 'milk-tea-workshop', title: '奶茶工坊与果实加工', description: '已接入配方与背包果实显式查询、唯一条目和锁定校验；本期七种普通森野作物单格、黄金芽四格和种子、果实专属图已核验；真正未登记的作物仍保留未知占地。', kind: 'gameplay', pattern: /种植加工|奶茶工坊/ },
   { key: 'milk-tea-hire', title: '雇佣、特长、班次与互动', description: '已接入候选、店铺空槽和我的工作显式查询；逐项费用确认与操作前资格重读，部分失败据实报告。', kind: 'gameplay', pattern: /雇佣好友|每班.*互动/ },
   { key: 'milk-tea-sales', title: '宣传喇叭、好友排行与销量日志', description: '已接入喇叭手动确认、指定页排行和指定日销量查询；不轮询、不自动翻页。', kind: 'gameplay', pattern: /宣传加速|宣传喇叭|排行榜|销量日志/ },
   { key: 'milk-tea-fund', title: '成长基金与快乐值奖励', description: '已接入已解锁基金、每日快乐值与档位手动领取；基金付费解锁、分享上报及好友链接由官方客户端完成。', kind: 'gameplay', pattern: /成长基金|累计快乐值|人气装饰/ },

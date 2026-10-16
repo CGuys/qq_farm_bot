@@ -38,9 +38,9 @@ test('十四种面板操作均先确认后发出；成员/槽位/配方/班次/�
   const q = queries(); q.shop.data = { slots: [{ slotIndex: 0 }] }; q.hireList.data = { durationId: 1, robots: [{ gid:'101',name:'员工',talentName:'服务' }] };
   q.workshop.data = { recipes:[{recipeId:2,name:'甜莓奶茶',unlocked:true}], fruits:[{uid:'23563',name:'森野甜莓',count:7}] };
   q.work.data = { myShift: { shiftId:'3001',interactPreviews:[{interactionType:1}] } };
-  const { root, events } = mountPanel(snapshot({ summary:{canUpgrade:true}, growthFund:{unlocked:true}, exchangeShop:{items:[{id:9,name:'种子',costs:[{id:1041,count:'10',name:'奶茶券'}]}]} }), q);
+  const { root, events } = mountPanel(snapshot({ summary:{canUpgrade:true}, growthFund:{unlocked:true}, exchangeShop:{items:[{id:9,name:'种子',costs:[{id:1041,count:'10',name:'奶茶券'}],exchangeBounds:{requestMax:999,limitKnown:true,hasPurchaseLimit:true,remainingLimit:5,affordableCount:20,maxCount:5,blockReason:'',unitCosts:[{itemId:1041,count:'10',name:'奶茶券'}]}}]} }), q);
   setModel(root,'店名','奶茶冲鸭'); setModel(root,'雇佣候选','101'); setModel(root,'加工果实','23563'); await vue.nextTick();
-  for (const label of ['开店','改名','升级','领取收银台','使用宣传喇叭','雇佣所选员工','暂停被雇佣','加工所选果实','领取工资','执行班次互动','确认兑换 种子','领取成长基金','领取每日快乐值','领取快乐值档位']) {
+  for (const label of ['开店','改名','升级','领取收银台','使用宣传喇叭','雇佣所选员工','暂停被雇佣','加工所选果实','领取工资','执行班次互动','确认兑换 种子 × 1','领取成长基金','领取每日快乐值','领取快乐值档位']) {
     const count = events.length; click(button(root,label)); await vue.nextTick(); assert.equal(events.length,count, '写前确认');
     assert.ok(findAll(root,n=>n.props.role==='dialog').length); click(button(root,'确认执行')); await vue.nextTick(); assert.equal(events.length,count+1);
   }
@@ -72,5 +72,5 @@ test('管理面板真实渲染奶茶说明的已适配与占地/图标/自动样
     if(spec==='@/api')return {__esModule:true,default:{}};
   });
   const root=makeNode('root');activeRoots.push(root);render(vue.h(Panel),root);await flush(); await vue.nextTick(); assert.equal(loads, 1, '真实mounted读取状态');
-  assert.match(textOf(root),/奶茶工坊与果实加工/);assert.match(textOf(root),/森野黄金芽四格映射和本期种子、果实专属图已核验/);assert.match(textOf(root),/自然成功样本/);render(null,root);
+  assert.match(textOf(root),/奶茶工坊与果实加工/);assert.match(textOf(root),/七种普通森野作物单格、黄金芽四格和种子、果实专属图已核验/);assert.match(textOf(root),/真正未登记的作物仍保留未知占地/);assert.match(textOf(root),/自然成功样本/);render(null,root);
 });
