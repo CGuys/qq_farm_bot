@@ -53,6 +53,32 @@ if(legacy){
 }
 `;
 
+// Both synthetic research CLIs require the other task's actual ready record.
+// Serial delegation therefore fails through the real stdio MCP path.
+const RESEARCH_NATIVE_CLI = NATIVE_CLI.replace("kind:main?'main':legacy?'legacy':'worker'",
+    "kind:main?'main':legacy?'legacy':input.includes('只读研究工具')?'research':'worker'")
+    .replace('}else if(!main){', String.raw`}else if(!main&&input.includes('只读研究工具')){
+ if(provider==='claude'&&!argv.includes('--strict-mcp-config'))throw Error('Research MCP is not isolated');
+ if(Object.keys(config).length)throw Error('Research received the Main bridge');
+ const id=input.match(/research-\d+(?=-instruction\.txt)/)[0];
+ const evidence=input.match(/仅可将本任务证据写入 ([^\n。]+)。/)[1];
+ write('core/data/'+id+'-ready.json',JSON.stringify({id,pid:process.pid,source:fs.readFileSync('core/src/example.js','utf8')}));
+ const cutoff=Date.now()+4000;
+ const timer=setInterval(()=>{
+  if(fs.existsSync('core/data/research-1-ready.json')&&fs.existsSync('core/data/research-2-ready.json')){
+   clearInterval(timer);write(path.relative(root,evidence),JSON.stringify({version:'fixture-sha',files:['core/src/example.js'],conclusion:'Read-only source evidence'}));
+   emit({decision:'no_change',summary:id+' inspected the fixed fixture source; no unverified changes'});
+  }else if(Date.now()>cutoff){clearInterval(timer);process.stderr.write('missing parallel research ready record\n');process.exitCode=1;}
+ },10);
+}else if(!main){`)
+    .replace("  await rpc('tools/list',{});", String.raw`  await rpc('tools/list',{});
+  const research=await Promise.all([
+   tool('delegate_worker',{instruction:'Read only source A within the shared budget',readOnly:true}),
+   tool('delegate_worker',{instruction:'Read independent source B within the shared budget',readOnly:true})
+  ]);
+  for(const result of research)if(result.isError)throw Error(result.content[0].text);
+  write('core/data/main-research-results.json',JSON.stringify({pid:process.pid,research}));`);
+
 function createRunnerFixture(t, options = {}) {
     const tempRoot = path.resolve(os.tmpdir());
     const prefix = path.resolve(tempRoot, 'farm-main-runner-');
@@ -93,7 +119,7 @@ function createRunnerFixture(t, options = {}) {
     write('web/node_modules/.bin/vite', '#!/usr/bin/env node\nrequire("../../build.cjs");\n');
     for (const file of ['web/node_modules/.bin/vue-tsc', 'web/node_modules/.bin/vite']) fs.chmodSync(target(file), 0o700);
     for (const agent of ['codex', 'claude']) {
-        write(`core/data/fake-${agent}`, NATIVE_CLI);
+        write(`core/data/fake-${agent}`, options.nativeCliSource || NATIVE_CLI);
         fs.chmodSync(target(`core/data/fake-${agent}`), 0o700);
     }
     fs.mkdirSync(target('core/data/logs'), { recursive: true });
@@ -143,6 +169,33 @@ if (require.main === module) {
             assert.ok(fs.existsSync(workerArtifact.logFile));
             assert.equal(fs.statSync(workerArtifact.logFile).mode & 0o777, 0o600);
             assert.ok(fs.existsSync(journal.validation.logFile));
+        });
+        test(`real ${settings.mainAgent} Main runs parallel ${settings.subAgent} research then its unique implementation through MCP`, t => {
+            assert.notEqual(RESEARCH_NATIVE_CLI, NATIVE_CLI);
+            const f = createRunnerFixture(t, { nativeCliSource: RESEARCH_NATIVE_CLI });
+            const result = f.run(settings);
+            assert.equal(result.status, 0, result.stderr + result.stdout);
+            const calls = fs.readFileSync(f.target('core/data/native-calls.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+            assert.equal(calls.filter(call => call.kind === 'main').length, 1);
+            assert.equal(calls.filter(call => call.kind === 'research').length, 2);
+            assert.equal(calls.filter(call => call.kind === 'worker').length, 1);
+            assert.ok(calls.filter(call => call.kind !== 'main').every(call => call.provider === settings.subAgent && call.promptLength <= 6000));
+            const main = calls.find(call => call.kind === 'main');
+            assert.equal(JSON.parse(fs.readFileSync(f.target('core/data/main-research-results.json'))).pid, main.pid);
+            assert.equal(JSON.parse(fs.readFileSync(f.target('core/data/main-continued.json'))).pid, main.pid);
+            for (const id of ['research-1', 'research-2']) {
+                assert.equal(JSON.parse(fs.readFileSync(f.target(`core/data/${id}-ready.json`))).source, 'module.exports = 1;\n');
+                const artifact = JSON.parse(fs.readFileSync(f.target(`core/data/logs/main-main-run/${id}.json`)));
+                assert.ok(fs.existsSync(artifact.logFile));
+                assert.equal(fs.statSync(artifact.logFile).mode & 0o777, 0o600);
+                const scope = JSON.parse(fs.readFileSync(f.target(`core/data/logs/main-main-run/${id}-scope.json`)));
+                assert.deepEqual(JSON.parse(fs.readFileSync(scope.evidenceFile)).files, ['core/src/example.js']);
+            }
+            const journal = JSON.parse(fs.readFileSync(f.target('core/data/logs/evolve-team-main-run.json')));
+            assert.equal(journal.status, 'completed'); assert.equal(journal.checkpoint.mainWorkflow.workerInvocations, 1);
+            assert.equal(journal.checkpoint.mainWorkflow.researchInvocations, 2);
+            assert.equal(fs.readFileSync(f.target('core/src/example.js'), 'utf8'), 'module.exports = 3;\n');
+            assert.equal(f.git(['status', '--porcelain']), '');
         });
     }
     test('cancellation waits for the owned CLI and grandchild; the owning Main stays alive', async t => {

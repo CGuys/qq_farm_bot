@@ -40,7 +40,7 @@ function fixture() {
     const f = {
         directory, files, checkpoints, progress,
         plan: { summary: 'Change one exact caller', allowedFiles: [FILE], acceptanceChecks: ['caller behavior'], baselineChecks: [] },
-        call: (name, args = {}) => handler(name, args, {}),
+        call: (name, args = {}, context = {}) => handler(name, args, context),
         edit: (file, text) => files.set(file, text),
         get closed() { return closed; }, get commits() { return commits; }, get verifies() { return verifies; },
         moveHead: () => { head = 'c'.repeat(40); },
@@ -72,6 +72,259 @@ async function accept(f, decision = 'approve') {
     assert.equal(seal.isError, false);
     return { decision: JSON.parse(seal.content[0].text).decision, summary: 'Main finished' };
 }
+function deferred() {
+    let resolve; let reject;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+}
+async function within(promise) {
+    let timer;
+    try {
+        return await Promise.race([promise, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('missing explicit research readiness')), 3000);
+        })]);
+    } finally { clearTimeout(timer); }
+}
+async function researchReady(ready, calls) {
+    let started = false;
+    const actualReady = ready.then(() => { started = true; });
+    await within(Promise.race([actualReady, ...calls.map(call => call.then(reply => {
+        if (!started) assert.equal(reply.isError, false, 'parallel read-only research must start instead of returning busy');
+        return actualReady;
+    }))]));
+}
+
+test('parallel research before approval keeps separate evidence and excludes writers until every reader settles', async () => {
+    const f = fixture(); const started = deferred(); const gates = new Map(); const ids = [];
+    let saving = 0;
+    f.options.onCheckpoint = async value => {
+        saving += 1;
+        assert.equal(saving, 1, 'checkpoint callbacks never overlap or overwrite newer evidence');
+        await new Promise(resolve => setImmediate(resolve));
+        f.checkpoints.push(JSON.parse(JSON.stringify(value)));
+        saving -= 1;
+    };
+    f.options.runWorker = async ({ invocationId, prompt, signal, allowedFiles }) => {
+        assert.ok(prompt.length <= 6000);
+        if (allowedFiles.length) {
+            f.edit(FILE, 'approved initial implementation');
+            return { decision: 'implemented', summary: 'Only the approved initial write' };
+        }
+        if (invocationId.startsWith('research-')) {
+            assert.match(prompt, /固定版本/); assert.match(prompt, /总 GitHub 请求预算/);
+        }
+        const gate = deferred(); gates.set(invocationId, gate); ids.push(invocationId);
+        const cancelled = () => gate.reject(createTeamError('cli_exit'));
+        if (signal.aborted) cancelled();
+        else signal.addEventListener('abort', cancelled, { once: true });
+        if (ids.length === 2) started.resolve();
+        await gate.promise;
+        return { decision: 'no_change', summary: `Evidence for ${invocationId}` };
+    };
+    f.options.runMain = async ({ prompt }) => {
+        const first = f.call('delegate_worker', { instruction: 'Compare fixed source A', readOnly: true });
+        const second = f.call('delegate_worker', { instruction: 'Inspect independent source B', readOnly: true });
+        try {
+            await researchReady(started.promise, [first, second]);
+            assert.deepEqual(ids, ['research-1', 'research-2']);
+            const before = JSON.parse((await f.call('status')).content[0].text);
+            assert.equal(before.activeResearch, 2); assert.equal(before.initialWorkerInvoked, false);
+            assert.deepEqual(before.allowedFiles, []);
+            gates.get('research-2').resolve();
+            assert.equal((await second).isError, false);
+            for (const [name, args] of [['approve_plan', f.plan], ['delegate_worker', { instruction: 'Cannot write while research runs' }],
+                ['verify_candidate', {}], ['accept_result', { decision: 'no_change', summary: 'Cannot seal pending research' }],
+                ['record_iteration', { cause: 'Cannot mutate task metadata yet', changes: [], remainingIssues: [], nextStep: 'wait' }]]) {
+                assert.equal(JSON.parse((await f.call(name, args)).content[0].text).code, 'busy');
+            }
+            assert.equal(JSON.parse((await f.call('status')).content[0].text).activeResearch, 1,
+                'a completed reader and rejected writers cannot release another reader');
+            gates.get('research-1').resolve();
+            assert.equal((await first).isError, false);
+        } finally { for (const gate of gates.values()) gate.resolve(); }
+        assert.match(prompt, /你自主决定是否委派、任务拆分和子 Agent 数量/);
+        assert.match(prompt, /你也必须等待所有研究 settle 后再直接修改源码/);
+        const researchCheckpoint = f.checkpoints.at(-1);
+        assert.equal(researchCheckpoint.mainWorkflow.workerInvocations, 0);
+        assert.equal(researchCheckpoint.mainWorkflow.researchInvocations, 2);
+        assert.equal(researchCheckpoint.completed.some(item => item.phase === 'implement'), false);
+        const evidence = ids.map(id => JSON.parse(fs.readFileSync(path.join(f.directory, 'logs/main-fixture', `${id}-scope.json`))));
+        assert.notEqual(evidence[0].evidenceFile, evidence[1].evidenceFile);
+        for (const { evidenceFile } of evidence) {
+            assert.ok(evidenceFile.startsWith(path.resolve(f.directory, 'logs/main-fixture') + path.sep));
+            assert.equal(fs.statSync(evidenceFile).mode & 0o777, 0o600);
+        }
+        assert.equal((await f.call('approve_plan', f.plan)).isError, false);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Perform the one initial write' })).isError, false);
+        return accept(f);
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'approve');
+    assert.equal(f.checkpoints.at(-1).mainWorkflow.workerInvocations, 1);
+    assert.equal(f.checkpoints.at(-1).mainWorkflow.researchInvocations, 2);
+    const sequences = f.checkpoints.map(value => value.mainWorkflow.memory.sequence);
+    assert.deepEqual(sequences, [...sequences].sort((a, b) => a - b));
+    assert.equal(f.commits, 1);
+});
+
+test('failed research preserves implementation and validation while Main must explicitly accept its later evidence', async () => {
+    const f = fixture();
+    f.options.runWorker = async ({ allowedFiles }) => {
+        if (!allowedFiles.length) throw createTeamError('cli_exit', { exitCode: 1 });
+        f.edit(FILE, 'actual worker change');
+        return { decision: 'implemented', summary: 'The completed initial implementation' };
+    };
+    f.options.runMain = async () => {
+        const failed = await f.call('delegate_worker', { instruction: 'Report a missing reference honestly', readOnly: true });
+        assert.equal(failed.isError, true);
+        assert.equal(JSON.parse(failed.content[0].text).state, 'research_failed');
+        const before = JSON.parse((await f.call('status')).content[0].text);
+        assert.equal(before.initialWorkerInvoked, false); assert.equal(before.lastFailure, null);
+        await f.call('approve_plan', f.plan);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Write the approved implementation' })).isError, false);
+        await accept(f);
+        const sealed = f.checkpoints.at(-1);
+        assert.equal((await f.call('delegate_worker', { instruction: 'An optional later comparison fails', readOnly: true })).isError, true);
+        const after = f.checkpoints.at(-1);
+        assert.deepEqual(after.completed, sealed.completed);
+        assert.equal(after.validationDigest, sealed.validationDigest);
+        assert.equal(after.lastFailure, sealed.lastFailure);
+        assert.equal(after.mainWorkflow.workerInvocations, 1);
+        assert.equal(after.mainWorkflow.researchInvocations, 2);
+        const resealed = await f.call('accept_result', { decision: 'approve', summary: 'Main reviewed the failed optional research and retained the verified change' });
+        assert.equal(resealed.isError, false, 'unchanged source validation is reusable for a fresh Main acceptance');
+        return { decision: JSON.parse(resealed.content[0].text).decision, summary: 'Main explicitly accepted the complete evidence' };
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'approve');
+    assert.equal(f.verifies, 1); assert.equal(f.commits, 1);
+});
+
+test('later research cannot reuse a seal made before Main evaluated that research', async () => {
+    for (const failedResearch of [false, true]) {
+        const f = fixture();
+        f.options.runWorker = async () => {
+            if (failedResearch) throw createTeamError('cli_exit');
+            return { decision: 'no_change', summary: 'Later source evidence needs Main judgment' };
+        };
+        f.options.runMain = async () => {
+            const stale = await accept(f, 'no_change');
+            const research = await f.call('delegate_worker', { instruction: 'Research after the old seal', readOnly: true });
+            assert.equal(research.isError, failedResearch);
+            assert.equal(JSON.parse(research.content[0].text).acceptanceRequired, true);
+            return stale;
+        };
+        await assert.rejects(runMainOwnedWorkflow(f.options), { code: 'review_rejected' });
+        assert.equal(f.verifies, 1); assert.equal(f.commits, 0);
+    }
+});
+
+test('cancelling one research returns its failure without releasing a still-running sibling or implementation permission', async () => {
+    const f = fixture(); const started = deferred(); const release = deferred(); const cancel = new AbortController(); let readers = 0;
+    f.options.runWorker = async ({ signal, invocationId }) => {
+        readers += 1; if (readers === 2) started.resolve();
+        if (invocationId === 'research-1') await new Promise((_, reject) => {
+            const cancelled = () => reject(createTeamError('cli_exit'));
+            if (signal.aborted) cancelled();
+            else signal.addEventListener('abort', cancelled, { once: true });
+        });
+        else await release.promise;
+        return { decision: 'no_change', summary: 'Independent sibling evidence' };
+    };
+    f.options.runMain = async () => {
+        const first = f.call('delegate_worker', { instruction: 'This query is cancelled', readOnly: true }, { signal: cancel.signal });
+        const second = f.call('delegate_worker', { instruction: 'This independent query continues', readOnly: true });
+        try {
+            await researchReady(started.promise, [first, second]); cancel.abort();
+            assert.equal((await first).isError, true);
+            const status = JSON.parse((await f.call('status')).content[0].text);
+            assert.equal(status.activeResearch, 1); assert.equal(status.initialWorkerInvoked, false); assert.equal(status.lastFailure, null);
+            assert.equal(JSON.parse((await f.call('approve_plan', f.plan)).content[0].text).code, 'busy');
+            assert.equal(JSON.parse((await f.call('accept_result', { decision: 'no_change', summary: 'Cannot seal a sibling task' })).content[0].text).code, 'busy');
+            release.resolve(); assert.equal((await second).isError, false);
+        } finally { cancel.abort(); release.resolve(); }
+        return accept(f, 'no_change');
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'no_change');
+    assert.equal(f.checkpoints.at(-1).mainWorkflow.workerInvocations, 0);
+});
+
+test('failed initial implementation still permits read-only help while Main retains all write repairs', async () => {
+    const f = fixture();
+    f.options.runWorker = async ({ allowedFiles }) => {
+        if (!allowedFiles.length) return { decision: 'no_change', summary: 'Read the exact failed caller' };
+        f.edit(FILE, 'partial write'); throw createTeamError('cli_exit', { exitCode: 1 });
+    };
+    f.options.runMain = async () => {
+        await f.call('approve_plan', f.plan);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Initial implementation fails' })).isError, true);
+        const prior = JSON.parse((await f.call('status')).content[0].text).lastFailure;
+        assert.equal((await f.call('delegate_worker', { instruction: 'Read evidence for Main to repair', readOnly: true })).isError, false);
+        assert.deepEqual(JSON.parse((await f.call('status')).content[0].text).lastFailure, prior);
+        const refused = await f.call('delegate_worker', { instruction: 'Cannot delegate a write repair' });
+        assert.equal(JSON.parse(refused.content[0].text).code, 'main_repair_required');
+        f.edit(FILE, 'Main repaired after reading the evidence');
+        return accept(f);
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'approve');
+});
+
+test('research counts survive recovery without manufacturing an implementation stage or consuming its write', async () => {
+    const f = fixture(); const ids = [];
+    f.options.runWorker = async ({ invocationId }) => { ids.push(invocationId); return { decision: 'no_change', summary: 'Actual bounded source reading' }; };
+    f.options.runMain = async () => {
+        assert.equal((await f.call('delegate_worker', { instruction: 'One initial read', readOnly: true })).isError, false);
+        throw createTeamError('cli_exit');
+    };
+    await assert.rejects(runMainOwnedWorkflow(f.options), { code: 'cli_exit' });
+    const { normalizeCheckpoint } = require('../src/services/evolution-team');
+    const checkpoint = normalizeCheckpoint(f.checkpoints.at(-1));
+    assert.equal(checkpoint.mainWorkflow.researchInvocations, 1);
+    assert.equal(checkpoint.mainWorkflow.workerInvocations, 0); assert.equal(checkpoint.mainWorkflow.initialWorkerInvoked, false);
+    f.options.resume = checkpoint; f.options.runId = 'research-recovered'; f.options.roundId = 'another-round';
+    f.options.runMain = async () => {
+        assert.equal((await f.call('delegate_worker', { instruction: 'Read another exact source', readOnly: true })).isError, false);
+        await f.call('approve_plan', f.plan);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Initial write remains available' })).isError, false);
+        assert.equal((await f.call('delegate_worker', { instruction: 'Research is still available after implementation', readOnly: true })).isError, false);
+        assert.equal(JSON.parse((await f.call('delegate_worker', { instruction: 'Second write remains forbidden' })).content[0].text).code,
+            'main_repair_required');
+        return accept(f, 'no_change');
+    };
+    assert.equal((await runMainOwnedWorkflow(f.options)).decision, 'no_change');
+    assert.deepEqual(ids, ['research-1', 'research-2', 'worker-1', 'research-3']);
+});
+
+test('Main exit cancels and waits for every concurrent research worker before closing its bridge', async () => {
+    for (const exit of ['throws', 'returns']) {
+        const f = fixture(); const started = deferred(); let active = 0; let exited = 0;
+        f.options.runWorker = ({ signal }) => new Promise((_, reject) => {
+            active += 1;
+            if (active === 2) started.resolve();
+            const cancelled = () => setImmediate(() => {
+                active -= 1; exited += 1; reject(createTeamError('cli_exit'));
+            });
+            if (signal.aborted) cancelled();
+            else signal.addEventListener('abort', cancelled, { once: true });
+        });
+        const bridge = f.options.createBridge;
+        f.options.createBridge = async options => {
+            const created = await bridge(options);
+            return { ...created, close: async () => {
+                assert.equal(active, 0); assert.equal(exited, 2); await created.close();
+            } };
+        };
+        f.options.runMain = async () => {
+            const first = f.call('delegate_worker', { instruction: 'Pending source A', readOnly: true });
+            const second = f.call('delegate_worker', { instruction: 'Pending source B', readOnly: true });
+            await researchReady(started.promise, [first, second]);
+            if (exit === 'throws') throw createTeamError('cli_exit');
+            return { decision: 'no_change', summary: 'Cannot end a run with pending readers' };
+        };
+        await assert.rejects(runMainOwnedWorkflow(f.options), { code: exit === 'throws' ? 'cli_exit' : 'unsafe_worktree' });
+        assert.equal(active, 0); assert.equal(exited, 2); assert.equal(f.closed, 1); assert.equal(f.commits, 0);
+        assert.equal(f.checkpoints.at(-1).mainWorkflow.researchInvocations, 2);
+        assert.equal(f.checkpoints.at(-1).mainWorkflow.workerInvocations, 0);
+    }
+});
 
 test('one Main receives a worker CLI failure, repairs its scope directly, validates and accepts', async () => {
     const f = fixture();
@@ -208,6 +461,8 @@ test('mutating tools exclude concurrency; a Main failure aborts and waits for it
         await f.call('approve_plan', f.plan);
         void f.call('delegate_worker', { instruction: 'wait for cancellation', allowedFiles: [FILE] });
         await ready;
+        const research = await f.call('delegate_worker', { instruction: 'Cannot research a moving write candidate', readOnly: true });
+        assert.equal(JSON.parse(research.content[0].text).code, 'busy');
         const competing = await f.call('verify_candidate');
         assert.equal(JSON.parse(competing.content[0].text).code, 'busy');
         throw createTeamError('cli_exit', { exitCode: 1 });
@@ -253,6 +508,7 @@ test('the first worker call remains consumed across rounds; all later repairs be
     f.options.roundId = 'next-round';
     f.options.runId = 'next-session';
     f.options.runMain = async () => {
+        assert.equal((await f.call('delegate_worker', { instruction: 'Only read the retained candidate after recovery', readOnly: true })).isError, false);
         const refused = await f.call('delegate_worker', { instruction: 'Cannot delegate repairs after a round change' });
         assert.equal(JSON.parse(refused.content[0].text).code, 'main_repair_required');
         f.edit(FILE, 'Main still owns its small authorized repair');
