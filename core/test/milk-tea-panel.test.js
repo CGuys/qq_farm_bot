@@ -36,11 +36,11 @@ test('实际页面六个查询按钮到store；挂载/普通刷新无这些请�
 
 test('十四种面板操作均先确认后发出；成员/槽位/配方/班次/费用取当前选择', async () => {
   const q = queries(); q.shop.data = { slots: [{ slotIndex: 0 }] }; q.hireList.data = { durationId: 1, robots: [{ gid:'101',name:'员工',talentName:'服务' }] };
-  q.workshop.data = { recipes:[{recipeId:2,name:'甜莓奶茶',unlocked:true}], fruits:[{uid:'23563',name:'森野甜莓',count:7}] };
+  q.workshop.data = { recipes:[{recipeId:2,fruitItemId:40525,name:'甜莓奶茶',unlocked:true}], fruits:[{uid:'23563',itemId:40525,name:'森野甜莓',count:7}] };
   q.work.data = { myShift: { shiftId:'3001',interactPreviews:[{interactionType:1}] } };
   const { root, events } = mountPanel(snapshot({ summary:{canUpgrade:true}, growthFund:{unlocked:true}, exchangeShop:{items:[{id:9,name:'种子',costs:[{id:1041,count:'10',name:'奶茶券'}],exchangeBounds:{requestMax:999,limitKnown:true,hasPurchaseLimit:true,remainingLimit:5,affordableCount:20,maxCount:5,blockReason:'',unitCosts:[{itemId:1041,count:'10',name:'奶茶券'}]}}]} }), q);
-  setModel(root,'店名','奶茶冲鸭'); setModel(root,'雇佣候选','101'); setModel(root,'加工果实','23563'); await vue.nextTick();
-  for (const label of ['开店','改名','升级','领取收银台','使用宣传喇叭','雇佣所选员工','暂停被雇佣','加工所选果实','领取工资','执行班次互动','确认兑换 种子 × 1','领取成长基金','领取每日快乐值','领取快乐值档位']) {
+  setModel(root,'店名','奶茶冲鸭'); setModel(root,'雇佣候选','101'); setModel(root,'选择森野甜莓，7个',['23563']); await vue.nextTick();
+  for (const label of ['开店','改名','升级','领取收银台','使用宣传喇叭','雇佣所选员工','暂停被雇佣','制作所选果实','领取工资','执行班次互动','确认兑换 种子 × 1','领取成长基金','领取每日快乐值','领取快乐值档位']) {
     const count = events.length; click(button(root,label)); await vue.nextTick(); assert.equal(events.length,count, '写前确认');
     assert.ok(findAll(root,n=>n.props.role==='dialog').length); click(button(root,'确认执行')); await vue.nextTick(); assert.equal(events.length,count+1);
   }
@@ -63,7 +63,7 @@ test('实际页面确认到store；切号往返/卸载后迟到写成功、普�
 
 test('管理面板真实渲染奶茶说明的已适配与占地/图标/自动样本待证边界', async () => {
   let loads = 0;
-  const useEvolutionStore = h.pinia.defineStore('evolution-panel', () => ({ evolve: vue.ref(null), startPolling() {}, stopPolling() {}, loadStatus: async () => (loads++, { ok: true, report: { scannedAt: 1, status: 'up-to-date', warnings: [], unknownActivityIds: [], detectedActivityIds: [], candidateCount: 0, caches: [], incompleteCandidates: [], online: { available: true, activities: [], unknownActivityIds: [], groups: [{ id: 2026110100, title: '奶茶热销中', payload: { tips: { txt: ['开店营业，升级小店，收银台','种植加工，奶茶工坊','雇佣好友，每班互动','宣传加速，宣传喇叭，排行榜，销量日志','成长基金，累计快乐值，人气装饰','48小时结算期，停止自动营业，未领收益通过邮件补发'] } } }] } } }) }));
+  const useEvolutionStore = h.pinia.defineStore('evolution-panel', () => ({ evolve: vue.ref(null), startPolling() {}, stopPolling() {}, loadStatus: async () => { loads += 1; return { ok: true, report: { scannedAt: 1, status: 'up-to-date', warnings: [], unknownActivityIds: [], detectedActivityIds: [], candidateCount: 0, caches: [], incompleteCandidates: [], online: { available: true, activities: [], unknownActivityIds: [], groups: [{ id: 2026110100, title: '奶茶热销中', payload: { tips: { txt: ['开店营业，升级小店，收银台','种植加工，奶茶工坊','雇佣好友，每班互动','宣传加速，宣传喇叭，排行榜，销量日志','成长基金，累计快乐值，人气装饰','48小时结算期，停止自动营业，未领收益通过邮件补发'] } } }] } } }; } }));
   h.pinia.setActivePinia(h.pinia.createPinia());
   const Panel = compileSfcModule(path.join(WEB,'src/components/admin/AdminActivityUpdatePanel.vue'), spec => {
     if(spec==='vue')return vue; if(spec==='vue-router')return require(path.join(WEB,'node_modules/vue-router')); if(spec==='pinia')return h.pinia;
@@ -73,4 +73,54 @@ test('管理面板真实渲染奶茶说明的已适配与占地/图标/自动样
   });
   const root=makeNode('root');activeRoots.push(root);render(vue.h(Panel),root);await flush(); await vue.nextTick(); assert.equal(loads, 1, '真实mounted读取状态');
   assert.match(textOf(root),/奶茶工坊与果实加工/);assert.match(textOf(root),/七种普通森野作物单格、黄金芽四格和种子、果实专属图已核验/);assert.match(textOf(root),/真正未登记的作物仍保留未知占地/);assert.match(textOf(root),/自然成功样本/);render(null,root);
+});
+
+
+test('批量制作多选、配方全选与一键全部在确认前零写，确认后一次提交完整整组数量', async () => {
+  const q = queries();
+  q.workshop.data = {
+    recipes: [{ recipeId: 2, fruitItemId: 40525, unlocked: true }, { recipeId: 3, fruitItemId: 40526, unlocked: true }, { recipeId: 4, fruitItemId: 40527, unlocked: false }],
+    fruits: [
+      { uid: '8001', itemId: 40525, name: '甜莓', count: '7' },
+      { uid: '8002', itemId: 40525, name: '黄金甜莓', count: '9' },
+      { uid: '8003', itemId: 40526, name: '白桃', count: '11' },
+      { uid: '8004', itemId: 40525, name: '锁定甜莓', count: '1', locked: true },
+      { uid: '8005', itemId: 40527, name: '未解锁甜橙', count: '1' },
+    ],
+  };
+  const { root, events } = mountPanel(snapshot(), q);
+  assert.equal(findAll(root, n => n.tag === 'input' && n.props.type === 'checkbox').length, 3);
+  setModel(root, '配方', 2); await vue.nextTick();
+  click(button(root, '全选当前配方')); await vue.nextTick();
+  assert.match(textOf(root), /已选 2 组，共 16 个果实/);
+  assert.equal(events.length, 0);
+  click(button(root, '制作所选果实')); await vue.nextTick();
+  const dialog = findAll(root, n => n.props.role === 'dialog')[0];
+  assert.match(textOf(dialog), /2 组、共 16 个果实/);
+  assert.match(textOf(dialog), /甜莓 × 7；黄金甜莓 × 9/);
+  assert.equal(events.length, 0);
+  click(button(root, '取消')); await vue.nextTick();
+  assert.equal(events.length, 0);
+  click(button(root, '一键制作全部')); await vue.nextTick();
+  assert.match(textOf(findAll(root, n => n.props.role === 'dialog')[0]), /3 组、共 27 个果实/);
+  click(button(root, '确认执行')); await vue.nextTick();
+  assert.equal(events.length, 1);
+  assert.equal(events[0][1], 'craft');
+  assert.deepEqual(events[0][2], { fruitUids: ['8001', '8002', '8003'], confirmedFruits: [
+    { uid: '8001', itemId: 40525, count: '7' }, { uid: '8002', itemId: 40525, count: '9' }, { uid: '8003', itemId: 40526, count: '11' },
+  ] });
+});
+
+test('批量制作确认期间材料更新会撤销旧确认与选择，不提交过时消耗', async () => {
+  const q = queries();
+  q.workshop.data = { recipes: [{ recipeId: 2, fruitItemId: 40525, unlocked: true }], fruits: [{ uid: '8001', itemId: 40525, name: '甜莓', count: '7' }] };
+  const state = vue.reactive(q);
+  const { root, events } = mountPanel(snapshot(), state);
+  click(button(root, '一键制作全部')); await vue.nextTick();
+  assert.ok(findAll(root, n => n.props.role === 'dialog').length);
+  state.workshop.data.fruits[0].count = '8'; await vue.nextTick();
+  assert.equal(findAll(root, n => n.props.role === 'dialog').length, 0);
+  assert.match(textOf(root), /请重新选择并确认/);
+  assert.equal(button(root, '制作所选果实').props.disabled, true);
+  assert.equal(events.length, 0);
 });
