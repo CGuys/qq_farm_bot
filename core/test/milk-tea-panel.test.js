@@ -35,7 +35,7 @@ test('实际页面六个查询按钮到store；挂载/普通刷新无这些请�
 });
 
 test('十四种面板操作均先确认后发出；成员/槽位/配方/班次/费用取当前选择', async () => {
-  const q = queries(); q.shop.data = { slots: [{ slotIndex: 0 }] }; q.hireList.data = { durationId: 1, robots: [{ gid:'101',name:'员工',talentName:'服务' }] };
+  const q = queries(); q.shop.data = { slots: [], employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [0] }; q.hireList.data = { durationId: 1, robots: [{ gid:'101',name:'员工',talentName:'服务' }] };
   q.workshop.data = { recipes:[{recipeId:2,fruitItemId:40525,name:'甜莓奶茶',unlocked:true}], fruits:[{uid:'23563',itemId:40525,name:'森野甜莓',count:7}] };
   q.work.data = { myShift: { shiftId:'3001',interactPreviews:[{interactionType:1}] } };
   const { root, events } = mountPanel(snapshot({ summary:{canUpgrade:true}, growthFund:{unlocked:true}, exchangeShop:{items:[{id:9,name:'种子',costs:[{id:1041,count:'10',name:'奶茶券'}],exchangeBounds:{requestMax:999,limitKnown:true,hasPurchaseLimit:true,remainingLimit:5,affordableCount:20,maxCount:5,blockReason:'',unitCosts:[{itemId:1041,count:'10',name:'奶茶券'}]}}]} }), q);
@@ -48,6 +48,67 @@ test('十四种面板操作均先确认后发出；成员/槽位/配方/班次/�
   assert.deepEqual(events.find(e=>e[1]==='hire')[2].confirmedCosts,[{itemId:1041,count:'40'}]);
   assert.deepEqual(events.find(e=>e[1]==='craft')[2].fruitUids,['23563']);
   assert.equal(events.find(e=>e[1]==='interact')[2].shiftId,'3001'); render(null,root);
+});
+
+test('雇佣面板使用已确认容量空位；稀疏列表可选择空槽，确认前零请求', async () => {
+  for (const freeSlotIndexes of [[0], [1]]) {
+    const q = queries();
+    q.shop.data = { level: 3, slots: [], employeeSlotCount: 2, slotAvailabilityKnown: true, freeSlotIndexes };
+    q.hireList.data = { durationId: 1, robots: [{ gid: '9101', name: '合成员工' }] };
+    const { root, events } = mountPanel(snapshot(), q);
+    setModel(root, '雇佣候选', '9101'); await vue.nextTick();
+    assert.doesNotMatch(textOf(root), /当前没有可雇佣空位/);
+    assert.match(textOf(root), /已开放 2 个槽位，当前可雇佣 1 位员工/);
+    const select = findAll(root, n => n.props['aria-label'] === '雇佣槽位')[0];
+    assert.deepEqual(findAll(select, n => n.tag === 'option').map(n => n.props.value), freeSlotIndexes);
+    const hire = button(root, '雇佣所选员工'); assert.equal(hire.props.disabled, false);
+    click(hire); await vue.nextTick(); assert.equal(events.length, 0);
+    assert.match(textOf(findAll(root, n => n.props.role === 'dialog')[0]), /40/);
+    click(button(root, '确认执行')); await vue.nextTick();
+    assert.deepEqual(events, [['operate', 'hire', { durationId: 1, hires: [{ slotIndex: freeSlotIndexes[0], targetGid: '9101' }], confirmedCosts: [{ itemId: 1041, count: '40' }] }]]);
+  }
+});
+
+test('雇佣面板区分满员、未确认、读取失败和加载，刷新空位只发原有只读查询', async () => {
+  const cases = [
+    { data: { employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [] }, message: /当前没有可雇佣空位/ },
+    { data: { slots: [] }, message: /雇佣空位尚未确认/ },
+    { data: { employeeSlotCount: null, slotAvailabilityKnown: false, freeSlotIndexes: [] }, message: /雇佣空位尚未确认/ },
+    { data: { employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [0] }, error: 'shop read failed', message: /雇佣空位读取失败/ },
+    { data: { employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [0] }, loading: true, message: /正在读取雇佣空位/ },
+  ];
+  for (const row of cases) {
+    const q = queries(); q.shop = { data: row.data, error: row.error || '', loading: row.loading || false };
+    q.hireList.data = { durationId: 1, robots: [{ gid: '9101' }] };
+    const { root, events } = mountPanel(snapshot(), q);
+    setModel(root, '雇佣候选', '9101'); await vue.nextTick();
+    assert.match(textOf(root), row.message);
+    if (row.error || !row.data.slotAvailabilityKnown) assert.doesNotMatch(textOf(root), /当前没有可雇佣空位/);
+    assert.equal(button(root, '雇佣所选员工').props.disabled, true);
+    assert.equal(events.length, 0);
+    if (!row.loading) {
+      const refresh = button(root, '刷新雇佣空位');
+      assert.ok(refresh, 'the hire section must offer the existing readonly shop query');
+      click(refresh); await vue.nextTick();
+      assert.deepEqual(events, [['query', 'shop', {}]]);
+    }
+  }
+});
+
+test('雇佣确认期间空位被占用或读取失败会撤销确认，不提交过时槽位', async () => {
+  const q = vue.reactive(queries());
+  q.shop.data = { employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [0] };
+  q.hireList.data = { durationId: 1, robots: [{ gid: '9101' }] };
+  const { root, events } = mountPanel(snapshot(), q);
+  setModel(root, '雇佣候选', '9101'); await vue.nextTick();
+  click(button(root, '雇佣所选员工')); await vue.nextTick();
+  assert.equal(findAll(root, n => n.props.role === 'dialog').length, 1);
+  q.shop.data = { employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [] }; await vue.nextTick();
+  assert.equal(findAll(root, n => n.props.role === 'dialog').length, 0); assert.equal(events.length, 0);
+  q.shop.data = { employeeSlotCount: 1, slotAvailabilityKnown: true, freeSlotIndexes: [0] }; await vue.nextTick();
+  click(button(root, '雇佣所选员工')); await vue.nextTick();
+  q.shop.error = 'fresh state unavailable'; await vue.nextTick();
+  assert.equal(findAll(root, n => n.props.role === 'dialog').length, 0); assert.equal(events.length, 0);
 });
 
 test('实际页面确认到store；切号往返/卸载后迟到写成功、普通失败和异常无提示无刷新', async () => {
