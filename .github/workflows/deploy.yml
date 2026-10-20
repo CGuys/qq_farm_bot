@@ -1,0 +1,54 @@
+name: Deploy to Server
+
+# 仅手动触发（Actions 页面点 Run workflow）。
+# ⚠️ 不要改成 on: push —— 本机 Bot 会通过隐私闸门自动向 GitHub 推送代码，
+#    一旦按 push 触发，Bot 未经人工确认的提交会直接重建线上服务。
+on:
+  workflow_dispatch:
+
+# 串行部署，避免两次部署同时重建容器
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REPO_URL: https://github.com/CGuys/qq_farm_bot.git
+  BRANCH: master
+  DEPLOY_PATH: /opt/qq-farm-bot
+  COMPOSE_FILE: docker-compose.prod.yml
+
+jobs:
+  deploy:
+    name: 部署到阿里云 ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出仓库（取服务器端部署脚本）
+        uses: actions/checkout@v4
+
+      - name: 准备 SSH 凭据
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -T 10 -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+          echo "SSH 凭据已就绪"
+
+      - name: 测试服务器连通性
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+            "${{ secrets.SERVER_USER || 'root' }}@${{ secrets.SERVER_HOST }}" \
+            'echo "已连接 $(hostname) $(date "+%F %T")"'
+
+      - name: 执行远程部署
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+            "${{ secrets.SERVER_USER || 'root' }}@${{ secrets.SERVER_HOST }}" \
+            "REPO_URL='$REPO_URL' BRANCH='$BRANCH' DEPLOY_PATH='$DEPLOY_PATH' COMPOSE_FILE='$COMPOSE_FILE' bash -s" \
+            < scripts/deploy-remote.sh
